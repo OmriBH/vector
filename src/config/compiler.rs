@@ -1,4 +1,5 @@
 use indexmap::{IndexMap, IndexSet};
+use rayon::prelude::*;
 use vector_lib::id::Inputs;
 
 use super::{
@@ -24,19 +25,33 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
 
     expand_globs(&mut builder);
 
-    if let Err(type_errors) = validation::check_shape(&builder) {
+    // Run validation checks in parallel for better performance with large configs
+    let (shape_result, (resources_result, (outputs_result, alpha_result))) = rayon::join(
+        || validation::check_shape(&builder),
+        || {
+            rayon::join(
+                || validation::check_resources(&builder),
+                || {
+                    rayon::join(
+                        || validation::check_outputs(&builder),
+                        || validation::check_buffer_utilization_ewma_alpha(&builder),
+                    )
+                },
+            )
+        },
+    );
+
+    // Collect errors from parallel validation
+    if let Err(type_errors) = shape_result {
         errors.extend(type_errors);
     }
-
-    if let Err(type_errors) = validation::check_resources(&builder) {
+    if let Err(type_errors) = resources_result {
         errors.extend(type_errors);
     }
-
-    if let Err(output_errors) = validation::check_outputs(&builder) {
+    if let Err(output_errors) = outputs_result {
         errors.extend(output_errors);
     }
-
-    if let Err(alpha_errors) = validation::check_buffer_utilization_ewma_alpha(&builder) {
+    if let Err(alpha_errors) = alpha_result {
         errors.extend(alpha_errors);
     }
 
@@ -99,31 +114,46 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
 
     // Inputs are resolved from string into OutputIds as part of graph construction, so update them
     // here before adding to the final config (the types require this).
-    let sinks = sinks
-        .into_iter()
+    // Use parallel iteration for better performance with large configs.
+    let sinks: IndexMap<_, _> = sinks
+        .into_par_iter()
         .map(|(key, sink)| {
             let inputs = graph.inputs_for(&key);
             (key, sink.with_inputs(inputs))
         })
         .collect();
-    let transforms = transforms
-        .into_iter()
+    let transforms: IndexMap<_, _> = transforms
+        .into_par_iter()
         .map(|(key, transform)| {
             let inputs = graph.inputs_for(&key);
             (key, transform.with_inputs(inputs))
         })
         .collect();
-    let enrichment_tables = enrichment_tables
-        .into_iter()
+    let enrichment_tables: IndexMap<_, _> = enrichment_tables
+        .into_par_iter()
         .map(|(key, table)| {
             let inputs = graph.inputs_for(&key);
             (key, table.with_inputs(inputs))
         })
         .collect();
-    let tests = tests
-        .into_iter()
+    // Tests resolution in parallel - collect results and then partition successes/failures
+    let test_results: Vec<_> = tests
+        .into_par_iter()
         .map(|test| test.resolve_outputs(&graph))
-        .collect::<Result<Vec<_>, Vec<_>>>()?;
+        .collect();
+
+    // Partition results into successes and failures
+    let mut tests = Vec::new();
+    let mut test_errors: Vec<String> = Vec::new();
+    for result in test_results {
+        match result {
+            Ok(test) => tests.push(test),
+            Err(errs) => test_errors.extend(errs),
+        }
+    }
+    if !test_errors.is_empty() {
+        return Err(test_errors);
+    }
 
     if errors.is_empty() {
         let mut config = Config {
@@ -153,9 +183,10 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
 
 /// Expand globs in input lists
 pub(crate) fn expand_globs(config: &mut ConfigBuilder) {
-    let candidates = config
+    // Collect source outputs in parallel for better performance with large configs
+    let source_outputs: Vec<_> = config
         .sources
-        .iter()
+        .par_iter()
         .flat_map(|(key, s)| {
             s.inner
                 .outputs(config.schema.log_namespace())
@@ -164,12 +195,26 @@ pub(crate) fn expand_globs(config: &mut ConfigBuilder) {
                     component: key.clone(),
                     port: output.port,
                 })
+                .collect::<Vec<_>>()
         })
-        .chain(config.transforms.iter().flat_map(|(key, t)| {
+        .collect();
+
+    // Collect transform outputs in parallel
+    let transform_outputs: Vec<_> = config
+        .transforms
+        .par_iter()
+        .flat_map(|(key, t)| {
             get_transform_output_ids(t.inner.as_ref(), key.clone(), config.schema.log_namespace())
-        }))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Combine into candidates set
+    let candidates: IndexSet<String> = source_outputs
+        .into_iter()
+        .chain(transform_outputs)
         .map(|output_id| output_id.to_string())
-        .collect::<IndexSet<String>>();
+        .collect();
 
     for (id, transform) in config.transforms.iter_mut() {
         expand_globs_inner(&mut transform.inputs, &id.to_string(), &candidates);
@@ -280,6 +325,94 @@ mod test {
                 ComponentKey::from("foo2"),
                 ComponentKey::from("foos")
             ]
+        );
+    }
+
+    /// Test that parallel compilation works correctly with many components.
+    /// This exercises the parallel validation, node creation, and input resolution.
+    #[test]
+    fn parallel_compilation_many_components() {
+        let mut builder = ConfigBuilder::default();
+
+        // Create many sources
+        let num_sources = 100;
+        for i in 0..num_sources {
+            builder.add_source(&format!("source_{i}"), basic_source().1);
+        }
+
+        // Create many transforms, each taking input from a source
+        let num_transforms = 100;
+        for i in 0..num_transforms {
+            let input = format!("source_{}", i % num_sources);
+            builder.add_transform(
+                &format!("transform_{i}"),
+                &[&input],
+                basic_transform("", 1.0),
+            );
+        }
+
+        // Create many sinks, each taking input from a transform
+        let num_sinks = 100;
+        for i in 0..num_sinks {
+            let input = format!("transform_{}", i % num_transforms);
+            builder.add_sink(&format!("sink_{i}"), &[&input], basic_sink(1).1);
+        }
+
+        // Compile the config - this exercises parallel processing
+        let config = builder.build().expect("build should succeed");
+
+        // Verify all components are present
+        assert_eq!(config.sources.len(), num_sources);
+        assert_eq!(config.transforms.len(), num_transforms);
+        assert_eq!(config.sinks.len(), num_sinks);
+
+        // Verify inputs are correctly resolved
+        for i in 0..num_sinks {
+            let sink = config
+                .sinks
+                .get(&ComponentKey::from(format!("sink_{i}")))
+                .expect("sink should exist");
+            assert_eq!(sink.inputs.len(), 1, "sink_{i} should have exactly 1 input");
+        }
+    }
+
+    /// Test that parallel compilation produces correct results with complex pipelines.
+    #[test]
+    fn parallel_compilation_complex_pipeline() {
+        let mut builder = ConfigBuilder::default();
+
+        // Create a fan-out / fan-in pattern
+        builder.add_source("main_source", basic_source().1);
+
+        // Fan-out: multiple transforms from one source
+        for i in 0..10 {
+            builder.add_transform(
+                &format!("fanout_{i}"),
+                &["main_source"],
+                basic_transform("", 1.0),
+            );
+        }
+
+        // Fan-in: one sink from multiple transforms
+        let inputs: Vec<String> = (0..10).map(|i| format!("fanout_{i}")).collect();
+        let input_refs: Vec<&str> = inputs.iter().map(|s| s.as_str()).collect();
+        builder.add_sink("final_sink", &input_refs, basic_sink(1).1);
+
+        let config = builder.build().expect("build should succeed");
+
+        assert_eq!(config.sources.len(), 1);
+        assert_eq!(config.transforms.len(), 10);
+        assert_eq!(config.sinks.len(), 1);
+
+        // Verify the final sink has all 10 inputs
+        let final_sink = config
+            .sinks
+            .get(&ComponentKey::from("final_sink"))
+            .expect("final_sink should exist");
+        assert_eq!(
+            final_sink.inputs.len(),
+            10,
+            "final_sink should have 10 inputs"
         );
     }
 

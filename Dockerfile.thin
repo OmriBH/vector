@@ -1,0 +1,51 @@
+# Multi-stage build for Vector with custom features (thin build)
+FROM docker.io/rust:1.87-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    libssl-dev \
+    libsasl2-dev \
+    pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    llvm-dev \
+    libclang-dev \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /vector
+
+# Copy the source code
+COPY . .
+
+# Build with specific features only (thin build)
+ENV CARGO_FEATURES="api,enrichment-tables,transforms,secrets,unix,\
+sources-file,sources-http_server,sources-http_client,sources-kafka,\
+sources-internal_logs,sources-internal_metrics,sources-vector,\
+sinks-clickhouse,sinks-file,sinks-http,sinks-kafka,\
+sinks-aws_cloudwatch_logs,sinks-aws_cloudwatch_metrics,\
+sinks-console,sinks-blackhole,sinks-vector,sinks-prometheus"
+
+RUN cargo build --release --no-default-features --features "${CARGO_FEATURES}"
+
+# Runtime stage
+FROM docker.io/debian:bookworm-slim
+
+LABEL org.opencontainers.image.description="Vector thin build with custom features"
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    libsasl2-2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the binary from builder
+COPY --from=builder /vector/target/release/vector /usr/bin/vector
+
+# Smoke test
+RUN ["/usr/bin/vector", "--version"]
+
+ENTRYPOINT ["/usr/bin/vector"]

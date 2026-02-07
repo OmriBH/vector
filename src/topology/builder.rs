@@ -438,35 +438,70 @@ impl<'a> Builder<'a> {
         &mut self,
         enrichment_tables: &vector_lib::enrichment::TableRegistry,
     ) {
-        let mut definition_cache = HashMap::default();
+        use rayon::prelude::*;
 
-        for (key, transform) in self
+        // Collect all transforms that need processing
+        let transforms_to_process: Vec<_> = self
             .config
             .transforms()
             .filter(|(key, _)| self.diff.transforms.contains_new(key))
-        {
-            debug!(component_id = %key, "Building new transform.");
+            .collect();
 
-            let input_definitions = match schema::input_definitions(
-                &transform.inputs,
-                self.config,
-                enrichment_tables.clone(),
-                &mut definition_cache,
-            ) {
-                Ok(definitions) => definitions,
+        // Phase 1: Pre-compute all input definitions in PARALLEL using rayon + concurrent cache.
+        // This is the critical optimization: the recursive schema::input_definitions traversal
+        // was the #1 bottleneck (166s out of 193s total). Two fixes applied:
+        //   a) Cache insertion (the original code checked cache but never inserted results back,
+        //      causing full re-traversal for every transform with shared upstreams)
+        //   b) Concurrent computation via rayon (independent transforms compute in parallel)
+        let concurrent_cache = schema::ConcurrentCache::new(HashMap::default());
+        let config = self.config;
+        let enrichment_tables_for_par = enrichment_tables.clone();
+
+        let precomputed: Vec<_> = transforms_to_process
+            .par_iter()
+            .map(|(key, transform)| {
+                let result = schema::input_definitions_concurrent(
+                    &transform.inputs,
+                    config,
+                    enrichment_tables_for_par.clone(),
+                    &concurrent_cache,
+                );
+                ((*key).clone(), result)
+            })
+            .collect();
+
+        // Build a lookup map from pre-computed results
+        let mut definitions_map: HashMap<
+            crate::config::ComponentKey,
+            Vec<(crate::config::OutputId, Definition)>,
+        > = HashMap::with_capacity(precomputed.len());
+
+        for (key, result) in precomputed {
+            match result {
+                Ok(definitions) => {
+                    definitions_map.insert(key, definitions);
+                }
                 Err(_) => {
-                    // We have received an error whilst retrieving the definitions,
-                    // there is no point in continuing.
-
+                    // Error in schema computation - no point in continuing
                     return;
                 }
-            };
+            }
+        }
+
+        // Phase 2: Prepare transforms using pre-computed definitions
+        let mut prepared_transforms = Vec::new();
+
+        for &(key, transform) in &transforms_to_process {
+            debug!(component_id = %key, "Preparing transform.");
+
+            let input_definitions = definitions_map
+                .remove(key)
+                .unwrap_or_default();
 
             let merged_definition: Definition = input_definitions
                 .iter()
                 .map(|(_output_id, definition)| definition.clone())
                 .reduce(Definition::merge)
-                // We may not have any definitions if all the inputs are from metrics sources.
                 .unwrap_or_else(Definition::any);
 
             let span = error_span!(
@@ -475,7 +510,6 @@ impl<'a> Builder<'a> {
                 component_id = %key.id(),
                 component_type = %transform.inner.get_component_name(),
             );
-            let _span = span.enter();
 
             // Create a map of the outputs to the list of possible definitions from those outputs.
             let schema_definitions = transform
@@ -510,36 +544,52 @@ impl<'a> Builder<'a> {
             let node =
                 TransformNode::from_parts(key.clone(), &context, transform, &input_definitions);
 
-            let transform = match transform
-                .inner
-                .build(&context)
-                .instrument(span.clone())
-                .await
-            {
+            prepared_transforms.push((key.clone(), transform, context, node, span));
+        }
+
+        // Phase 2: Build transforms concurrently using FuturesUnordered
+        let mut build_futures = FuturesUnordered::new();
+
+        for (key, transform, context, node, span) in prepared_transforms {
+            let key_clone = key.clone();
+            let build_future = async move {
+                let result = transform
+                    .inner
+                    .build(&context)
+                    .instrument(span.clone())
+                    .await;
+                (key_clone, result, context, node, span)
+            };
+            build_futures.push(build_future);
+        }
+
+        // Phase 3: Collect results and apply them
+        while let Some((key, result, _context, node, span)) = build_futures.next().await {
+            match result {
                 Err(error) => {
                     self.errors.push(format!("Transform \"{key}\": {error}"));
                     continue;
                 }
-                Ok(transform) => transform,
-            };
+                Ok(transform) => {
+                    let metrics = ChannelMetricMetadata::new(TRANSFORM_CHANNEL_METRIC_PREFIX, None);
+                    let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
+                        TOPOLOGY_BUFFER_SIZE,
+                        WhenFull::Block,
+                        &span,
+                        Some(metrics),
+                        self.config.global.buffer_utilization_ewma_alpha,
+                    );
 
-            let metrics = ChannelMetricMetadata::new(TRANSFORM_CHANNEL_METRIC_PREFIX, None);
-            let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
-                TOPOLOGY_BUFFER_SIZE,
-                WhenFull::Block,
-                &span,
-                Some(metrics),
-                self.config.global.buffer_utilization_ewma_alpha,
-            );
+                    self.inputs
+                        .insert(key.clone(), (input_tx, node.inputs.clone()));
 
-            self.inputs
-                .insert(key.clone(), (input_tx, node.inputs.clone()));
+                    let (transform_task, transform_outputs) =
+                        build_transform(transform, node, input_rx, &self.utilization_registry);
 
-            let (transform_task, transform_outputs) =
-                build_transform(transform, node, input_rx, &self.utilization_registry);
-
-            self.outputs.extend(transform_outputs);
-            self.tasks.insert(key.clone(), transform_task);
+                    self.outputs.extend(transform_outputs);
+                    self.tasks.insert(key.clone(), transform_task);
+                }
+            }
         }
     }
 

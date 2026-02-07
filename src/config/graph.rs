@@ -4,6 +4,7 @@ use std::{
 };
 
 use indexmap::{IndexMap, set::IndexSet};
+use rayon::prelude::*;
 
 use super::{
     ComponentKey, DataType, OutputId, SinkOuter, SourceOuter, SourceOutput, TransformContext,
@@ -96,59 +97,104 @@ impl Graph {
         let mut graph = Graph::default();
         let mut errors = Vec::new();
 
-        // First, insert all of the different node types
-        for (id, config) in sources.iter() {
-            graph.nodes.insert(
-                id.clone(),
-                Node::Source {
-                    outputs: config.inner.outputs(schema.log_namespace()),
-                },
-            );
-        }
+        // Create nodes in parallel for better performance with large configs
+        // Source nodes
+        let source_nodes: Vec<_> = sources
+            .par_iter()
+            .map(|(id, config)| {
+                (
+                    id.clone(),
+                    Node::Source {
+                        outputs: config.inner.outputs(schema.log_namespace()),
+                    },
+                )
+            })
+            .collect();
 
-        for (id, transform) in transforms.iter() {
-            graph.nodes.insert(
-                id.clone(),
-                Node::Transform {
-                    in_ty: transform.inner.input().data_type(),
-                    outputs: transform.inner.outputs(
-                        &TransformContext {
-                            schema,
-                            ..Default::default()
-                        },
-                        &[(id.into(), schema::Definition::any())],
-                    ),
-                },
-            );
-        }
+        // Transform nodes
+        let transform_nodes: Vec<_> = transforms
+            .par_iter()
+            .map(|(id, transform)| {
+                (
+                    id.clone(),
+                    Node::Transform {
+                        in_ty: transform.inner.input().data_type(),
+                        outputs: transform.inner.outputs(
+                            &TransformContext {
+                                schema,
+                                ..Default::default()
+                            },
+                            &[(id.into(), schema::Definition::any())],
+                        ),
+                    },
+                )
+            })
+            .collect();
 
-        for (id, config) in sinks {
-            graph.nodes.insert(
-                id.clone(),
-                Node::Sink {
-                    ty: config.inner.input().data_type(),
-                },
-            );
-        }
+        // Sink nodes
+        let sink_nodes: Vec<_> = sinks
+            .par_iter()
+            .map(|(id, config)| {
+                (
+                    id.clone(),
+                    Node::Sink {
+                        ty: config.inner.input().data_type(),
+                    },
+                )
+            })
+            .collect();
+
+        // Bulk insert nodes into the graph
+        graph.nodes.extend(source_nodes);
+        graph.nodes.extend(transform_nodes);
+        graph.nodes.extend(sink_nodes);
 
         // With all of the nodes added, go through inputs and add edges, resolving strings into
         // actual `OutputId`s along the way.
         let available_inputs = graph.input_map()?;
 
-        for (id, config) in transforms.iter() {
-            for input in config.inputs.iter() {
-                if let Err(e) = graph.add_input(input, id, &available_inputs, wildcard_matching) {
-                    errors.push(e);
+        // Collect transform edges in parallel for better performance with large configs
+        let transform_results: Vec<_> = transforms
+            .par_iter()
+            .map(|(id, config)| {
+                let mut edges = Vec::new();
+                let mut errs = Vec::new();
+                for input in config.inputs.iter() {
+                    match graph.resolve_input(input, id, &available_inputs, wildcard_matching) {
+                        Ok(Some(edge)) => edges.push(edge),
+                        Ok(None) => {} // Relaxed wildcard matching, no edge needed
+                        Err(e) => errs.push(e),
+                    }
                 }
-            }
-        }
+                (edges, errs)
+            })
+            .collect();
 
-        for (id, config) in sinks {
-            for input in config.inputs.iter() {
-                if let Err(e) = graph.add_input(input, id, &available_inputs, wildcard_matching) {
-                    errors.push(e);
+        // Collect sink edges in parallel
+        let sink_results: Vec<_> = sinks
+            .par_iter()
+            .map(|(id, config)| {
+                let mut edges = Vec::new();
+                let mut errs = Vec::new();
+                for input in config.inputs.iter() {
+                    match graph.resolve_input(input, id, &available_inputs, wildcard_matching) {
+                        Ok(Some(edge)) => edges.push(edge),
+                        Ok(None) => {} // Relaxed wildcard matching, no edge needed
+                        Err(e) => errs.push(e),
+                    }
                 }
-            }
+                (edges, errs)
+            })
+            .collect();
+
+        // Bulk insert edges and collect errors
+        for (edges, errs) in transform_results {
+            graph.edges.extend(edges);
+            errors.extend(errs);
+        }
+        for (edges, errs) in sink_results {
+            graph.edges.extend(edges);
+            errors.extend(errs);
         }
 
         if ignore_errors || errors.is_empty() {
@@ -158,6 +204,7 @@ impl Graph {
         }
     }
 
+    #[allow(dead_code)]
     fn add_input(
         &mut self,
         from: &str,
@@ -187,6 +234,55 @@ impl Graph {
                             "Input \"{from}\" for {output_type} \"{to}\" didn’t match any components, but this was ignored because `relaxed_wildcard_matching` is enabled."
                         );
                         return Ok(());
+                    }
+                }
+                WildcardMatching::Strict => {}
+            }
+            info!(
+                "Available components:\n{}",
+                self.nodes
+                    .iter()
+                    .map(|(key, node)| format!("\"{key}\":\n  {node}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            Err(format!(
+                "Input \"{from}\" for {output_type} \"{to}\" doesn't match any components.",
+            ))
+        }
+    }
+
+    /// Resolve an input string to an edge without mutating the graph.
+    /// Returns Ok(Some(edge)) on success, Ok(None) for relaxed wildcard matching with no match,
+    /// and Err for errors.
+    fn resolve_input(
+        &self,
+        from: &str,
+        to: &ComponentKey,
+        available_inputs: &HashMap<String, OutputId>,
+        wildcard_matching: WildcardMatching,
+    ) -> Result<Option<Edge>, String> {
+        if let Some(output_id) = available_inputs.get(from) {
+            Ok(Some(Edge {
+                from: output_id.clone(),
+                to: to.clone(),
+            }))
+        } else {
+            let output_type = match self.nodes.get(to) {
+                Some(Node::Transform { .. }) => "transform",
+                Some(Node::Sink { .. }) => "sink",
+                _ => panic!("only transforms and sinks have inputs"),
+            };
+            // allow empty result if relaxed wildcard matching is enabled
+            match wildcard_matching {
+                WildcardMatching::Relaxed => {
+                    // using value != glob::Pattern::escape(value) to check if value is a glob
+                    // TODO: replace with proper check when https://github.com/rust-lang/glob/issues/72 is resolved
+                    if from != glob::Pattern::escape(from) {
+                        info!(
+                            "Input \"{from}\" for {output_type} \"{to}\" didn't match any components, but this was ignored because `relaxed_wildcard_matching` is enabled."
+                        );
+                        return Ok(None);
                     }
                 }
                 WildcardMatching::Strict => {}
@@ -242,20 +338,24 @@ impl Graph {
     }
 
     pub fn typecheck(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
+        // Check edges in parallel for better performance with large configs
+        let mut errors: Vec<_> = self
+            .edges
+            .par_iter()
+            .filter_map(|edge| {
+                let from_ty = self.get_output_type(&edge.from);
+                let to_ty = self.get_input_type(&edge.to);
 
-        // check that all edges connect components with compatible data types
-        for edge in &self.edges {
-            let from_ty = self.get_output_type(&edge.from);
-            let to_ty = self.get_input_type(&edge.to);
-
-            if !from_ty.intersects(to_ty) {
-                errors.push(format!(
-                    "Data type mismatch between {} ({}) and {} ({})",
-                    edge.from, from_ty, edge.to, to_ty
-                ));
-            }
-        }
+                if !from_ty.intersects(to_ty) {
+                    Some(format!(
+                        "Data type mismatch between {} ({}) and {} ({})",
+                        edge.from, from_ty, edge.to, to_ty
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         if errors.is_empty() {
             Ok(())
