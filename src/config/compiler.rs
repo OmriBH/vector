@@ -1,13 +1,15 @@
+use std::time::Instant;
+
 use indexmap::{IndexMap, IndexSet};
 use rayon::prelude::*;
 use vector_lib::id::Inputs;
 
 use super::{
-    Config, OutputId, builder::ConfigBuilder, graph::Graph, transform::get_transform_output_ids,
-    validation,
+    Config, builder::ConfigBuilder, graph::Graph, transform::get_transform_output_ids, validation,
 };
 
 pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<String>> {
+    let compile_start = Instant::now();
     let mut errors = Vec::new();
 
     // component names should not have dots in the configuration file
@@ -23,9 +25,15 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
         errors.extend(name_errors);
     }
 
+    let globs_start = Instant::now();
     expand_globs(&mut builder);
+    info!(
+        elapsed_ms = globs_start.elapsed().as_millis() as u64,
+        "Glob expansion complete."
+    );
 
     // Run validation checks in parallel for better performance with large configs
+    let validation_start = Instant::now();
     let (shape_result, (resources_result, (outputs_result, alpha_result))) = rayon::join(
         || validation::check_shape(&builder),
         || {
@@ -54,6 +62,10 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
     if let Err(alpha_errors) = alpha_result {
         errors.extend(alpha_errors);
     }
+    info!(
+        elapsed_ms = validation_start.elapsed().as_millis() as u64,
+        "Validation checks complete."
+    );
 
     let ConfigBuilder {
         global,
@@ -90,6 +102,7 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
         )
         .collect::<IndexMap<_, _>>();
 
+    let graph_start = Instant::now();
     let graph = match Graph::new(
         &sources_and_table_sources,
         &transforms,
@@ -103,18 +116,33 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
             return Err(errors);
         }
     };
+    info!(
+        elapsed_ms = graph_start.elapsed().as_millis() as u64,
+        "Graph construction complete."
+    );
 
+    let typecheck_start = Instant::now();
     if let Err(type_errors) = graph.typecheck() {
         errors.extend(type_errors);
     }
+    info!(
+        elapsed_ms = typecheck_start.elapsed().as_millis() as u64,
+        "Type checking complete."
+    );
 
+    let cycle_start = Instant::now();
     if let Err(e) = graph.check_for_cycles() {
         errors.push(e);
     }
+    info!(
+        elapsed_ms = cycle_start.elapsed().as_millis() as u64,
+        "Cycle detection complete."
+    );
 
     // Inputs are resolved from string into OutputIds as part of graph construction, so update them
     // here before adding to the final config (the types require this).
     // Use parallel iteration for better performance with large configs.
+    let input_resolution_start = Instant::now();
     let sinks: IndexMap<_, _> = sinks
         .into_par_iter()
         .map(|(key, sink)| {
@@ -154,6 +182,15 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
     if !test_errors.is_empty() {
         return Err(test_errors);
     }
+    info!(
+        elapsed_ms = input_resolution_start.elapsed().as_millis() as u64,
+        "Input resolution complete."
+    );
+
+    info!(
+        total_elapsed_ms = compile_start.elapsed().as_millis() as u64,
+        "Config compilation finished."
+    );
 
     if errors.is_empty() {
         let mut config = Config {
@@ -183,46 +220,90 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
 
 /// Expand globs in input lists
 pub(crate) fn expand_globs(config: &mut ConfigBuilder) {
-    // Collect source outputs in parallel for better performance with large configs
-    let source_outputs: Vec<_> = config
-        .sources
-        .par_iter()
-        .flat_map(|(key, s)| {
-            s.inner
-                .outputs(config.schema.log_namespace())
-                .into_iter()
-                .map(|output| OutputId {
-                    component: key.clone(),
-                    port: output.port,
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Build candidates set from component keys directly — O(1) per component.
+    // This avoids calling .outputs() for 100K+ sources/transforms (which takes ~17s),
+    // since the vast majority have only a default output (port: None) and their
+    // candidate string is just the component key.
+    let mut candidates: IndexSet<String> = IndexSet::with_capacity(
+        config.sources.len() + config.transforms.len(),
+    );
 
-    // Collect transform outputs in parallel
-    let transform_outputs: Vec<_> = config
+    for key in config.sources.keys() {
+        candidates.insert(key.to_string());
+    }
+    for key in config.transforms.keys() {
+        candidates.insert(key.to_string());
+    }
+
+    // Port-specific candidates (like "route_transform.matched") are only needed
+    // if a glob pattern could match them. Port candidates contain a dot, so we
+    // only do the expensive .outputs() collection if any glob contains a dot.
+    let needs_port_candidates = config
         .transforms
-        .par_iter()
-        .flat_map(|(key, t)| {
-            get_transform_output_ids(t.inner.as_ref(), key.clone(), config.schema.log_namespace())
-                .collect::<Vec<_>>()
+        .values()
+        .any(|t| {
+            t.inputs
+                .iter()
+                .any(|i| is_glob_pattern(i) && i.contains('.'))
         })
-        .collect();
+        || config
+            .sinks
+            .values()
+            .any(|s| {
+                s.inputs
+                    .iter()
+                    .any(|i| is_glob_pattern(i) && i.contains('.'))
+            });
 
-    // Combine into candidates set
-    let candidates: IndexSet<String> = source_outputs
-        .into_iter()
-        .chain(transform_outputs)
-        .map(|output_id| output_id.to_string())
-        .collect();
+    if needs_port_candidates {
+        // Only call .outputs() for transform types known to produce named ports.
+        // Most transforms (remap, filter, etc.) have a single default output
+        // and their candidate is already in the key-based set.
+        // This avoids calling the expensive .outputs() for 100K+ transforms.
+        const MULTI_OUTPUT_TYPES: &[&str] = &["route", "exclusive_route", "remap"];
 
-    for (id, transform) in config.transforms.iter_mut() {
-        expand_globs_inner(&mut transform.inputs, &id.to_string(), &candidates);
+        let transform_port_candidates: Vec<String> = config
+            .transforms
+            .par_iter()
+            .filter(|(_, t)| {
+                let name = t.inner.get_component_name();
+                MULTI_OUTPUT_TYPES.contains(&name)
+            })
+            .flat_map(|(key, t)| {
+                get_transform_output_ids(
+                    t.inner.as_ref(),
+                    key.clone(),
+                    config.schema.log_namespace(),
+                )
+                .filter(|output_id| output_id.port.is_some())
+                .map(|output_id| output_id.to_string())
+                .collect::<Vec<_>>()
+            })
+            .collect();
+
+        if !transform_port_candidates.is_empty() {
+            info!(
+                count = transform_port_candidates.len(),
+                "Added port-specific candidates from multi-output transforms."
+            );
+        }
+
+        for candidate in transform_port_candidates {
+            candidates.insert(candidate);
+        }
     }
 
-    for (id, sink) in config.sinks.iter_mut() {
+    // Expand globs in parallel — each component's input list is independent
+    config
+        .transforms
+        .par_iter_mut()
+        .for_each(|(id, transform)| {
+            expand_globs_inner(&mut transform.inputs, &id.to_string(), &candidates);
+        });
+
+    config.sinks.par_iter_mut().for_each(|(id, sink)| {
         expand_globs_inner(&mut sink.inputs, &id.to_string(), &candidates);
-    }
+    });
 }
 
 enum InputMatcher {
@@ -241,9 +322,27 @@ impl InputMatcher {
     }
 }
 
+/// Returns true if the string contains glob metacharacters (*, ?, [).
+fn is_glob_pattern(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
+}
+
 fn expand_globs_inner(inputs: &mut Inputs<String>, id: &str, candidates: &IndexSet<String>) {
     let raw_inputs = std::mem::take(inputs);
     for raw_input in raw_inputs {
+        // Fast path: if the input is a literal (no glob chars), do an O(1) set lookup
+        // instead of iterating through all candidates. This is the common case.
+        if !is_glob_pattern(&raw_input) {
+            if candidates.contains(&raw_input) && raw_input != id {
+                inputs.extend(Some(raw_input));
+            } else {
+                // Leave unmatched literals as-is for better error messages downstream
+                inputs.extend(Some(raw_input));
+            }
+            continue;
+        }
+
+        // Slow path: actual glob pattern — must iterate candidates
         let matcher = glob::Pattern::new(&raw_input)
             .map(InputMatcher::Pattern)
             .unwrap_or_else(|error| {

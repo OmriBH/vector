@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Read, path::Path};
+use std::{collections::HashMap, io::Read, path::Path, time::Instant};
 
 use indexmap::IndexMap;
 use rayon::prelude::*;
@@ -67,12 +67,18 @@ impl ConfigBuilderLoader {
             .collect();
 
         // Process files in parallel
+        let file_read_start = Instant::now();
         let parallel_results: Vec<_> = file_info
             .par_iter()
             .map(|(path, format)| {
                 process_config_file(path, *format, self.interpolate_env, &self.secrets)
             })
             .collect();
+        info!(
+            elapsed_ms = file_read_start.elapsed().as_millis() as u64,
+            file_count = file_info.len(),
+            "File reading and TOML parsing complete."
+        );
 
         // Collect errors and successful results
         let mut errors = Vec::new();
@@ -87,12 +93,18 @@ impl ConfigBuilderLoader {
         }
 
         // Deserialize tables in parallel for better performance with large configs
+        let deser_start = Instant::now();
         let deserialized: Vec<_> = tables
             .into_par_iter()
             .map(|(_name, table)| deserialize_table::<ConfigBuilder>(table))
             .collect();
+        info!(
+            elapsed_ms = deser_start.elapsed().as_millis() as u64,
+            "TOML table deserialization complete."
+        );
 
         // Merge deserialized ConfigBuilders sequentially (order matters)
+        let merge_start = Instant::now();
         for result in deserialized {
             match result {
                 Ok(config) => {
@@ -103,14 +115,27 @@ impl ConfigBuilderLoader {
                 Err(errs) => errors.extend(errs),
             }
         }
+        info!(
+            elapsed_ms = merge_start.elapsed().as_millis() as u64,
+            "ConfigBuilder merge complete."
+        );
 
         // Process directories with parallel file loading
-        for dir in dirs {
+        let dir_start = Instant::now();
+        let dir_count = dirs.len();
+        for dir in &dirs {
             if let ConfigPath::Dir(path) = dir {
                 if let Err(errs) = self.load_from_dir_parallel(path) {
                     errors.extend(errs);
                 }
             }
+        }
+        if dir_count > 0 {
+            info!(
+                elapsed_ms = dir_start.elapsed().as_millis() as u64,
+                dir_count = dirs.len(),
+                "Directory config loading complete."
+            );
         }
 
         if errors.is_empty() {

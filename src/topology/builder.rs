@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::ready,
     num::NonZeroUsize,
     sync::{Arc, LazyLock, Mutex},
@@ -35,7 +35,7 @@ use vector_vrl_metrics::MetricsStorage;
 use super::{
     BuiltBuffer, ConfigDiff,
     fanout::{self, Fanout},
-    schema,
+    schema::{self, ComponentContainer},
     task::{Task, TaskOutput, TaskResult},
 };
 use crate::{
@@ -440,6 +440,8 @@ impl<'a> Builder<'a> {
     ) {
         use rayon::prelude::*;
 
+        let build_transforms_start = Instant::now();
+
         // Collect all transforms that need processing
         let transforms_to_process: Vec<_> = self
             .config
@@ -447,150 +449,313 @@ impl<'a> Builder<'a> {
             .filter(|(key, _)| self.diff.transforms.contains_new(key))
             .collect();
 
-        // Phase 1: Pre-compute all input definitions in PARALLEL using rayon + concurrent cache.
-        // This is the critical optimization: the recursive schema::input_definitions traversal
-        // was the #1 bottleneck (166s out of 193s total). Two fixes applied:
-        //   a) Cache insertion (the original code checked cache but never inserted results back,
-        //      causing full re-traversal for every transform with shared upstreams)
-        //   b) Concurrent computation via rayon (independent transforms compute in parallel)
+        info!(
+            transform_count = transforms_to_process.len(),
+            "Starting transform build pipeline."
+        );
+
+        // --- Schema definition resolution (topological layer processing) ---
+        // Processes transforms in dependency order: layer 0 = transforms whose inputs
+        // are all sources, layer 1 = transforms whose inputs are all sources or layer-0
+        // transforms, etc. Within each layer, all transforms are processed in parallel.
+        // This guarantees cache hits for all upstream dependencies, eliminating redundant
+        // recursive computation that caused 36s latency when all transforms raced at once.
+        let schema_start = Instant::now();
         let concurrent_cache = schema::ConcurrentCache::new(HashMap::default());
+        let outputs_cache = schema::TransformOutputsCache::new(HashMap::default());
         let config = self.config;
         let enrichment_tables_for_par = enrichment_tables.clone();
 
-        let precomputed: Vec<_> = transforms_to_process
-            .par_iter()
-            .map(|(key, transform)| {
-                let result = schema::input_definitions_concurrent(
-                    &transform.inputs,
-                    config,
-                    enrichment_tables_for_par.clone(),
-                    &concurrent_cache,
-                );
-                ((*key).clone(), result)
-            })
+        // Build a set of all source keys for fast lookup
+        let source_keys: HashSet<&crate::config::ComponentKey> =
+            config.sources().map(|(k, _)| k).collect();
+
+        // Build a set of all transform keys involved
+        let transform_keys: HashSet<&crate::config::ComponentKey> = transforms_to_process
+            .iter()
+            .map(|(key, _)| *key)
             .collect();
+
+        // Assign each transform to a topological layer
+        // Layer 0: all inputs are sources (or non-transforms)
+        // Layer N: all inputs are sources or transforms in layers 0..N-1
+        let mut transform_layer: HashMap<&crate::config::ComponentKey, usize> =
+            HashMap::with_capacity(transforms_to_process.len());
+        let mut assigned = 0usize;
+        let total = transforms_to_process.len();
+        let mut current_layer = 0usize;
+
+        while assigned < total {
+            let mut newly_assigned = Vec::new();
+            for &(key, transform) in &transforms_to_process {
+                if transform_layer.contains_key(key) {
+                    continue;
+                }
+                // Check if all input components are either sources or already-assigned transforms
+                let all_deps_resolved = transform.inputs.iter().all(|input| {
+                    let comp = &input.component;
+                    source_keys.contains(comp)
+                        || !transform_keys.contains(comp)
+                        || transform_layer.contains_key(comp)
+                });
+                if all_deps_resolved {
+                    newly_assigned.push(key);
+                }
+            }
+            if newly_assigned.is_empty() {
+                // Remaining transforms have circular deps or unresolvable inputs;
+                // fall back to processing them all at once (cache will still help)
+                for &(key, _) in &transforms_to_process {
+                    if !transform_layer.contains_key(key) {
+                        transform_layer.insert(key, current_layer);
+                        assigned += 1;
+                    }
+                }
+            } else {
+                for key in &newly_assigned {
+                    transform_layer.insert(*key, current_layer);
+                    assigned += 1;
+                }
+                current_layer += 1;
+            }
+        }
+
+        let num_layers = current_layer;
 
         // Build a lookup map from pre-computed results
         let mut definitions_map: HashMap<
             crate::config::ComponentKey,
             Vec<(crate::config::OutputId, Definition)>,
-        > = HashMap::with_capacity(precomputed.len());
+        > = HashMap::with_capacity(transforms_to_process.len());
 
-        for (key, result) in precomputed {
-            match result {
-                Ok(definitions) => {
-                    definitions_map.insert(key, definitions);
-                }
-                Err(_) => {
-                    // Error in schema computation - no point in continuing
-                    return;
-                }
-            }
-        }
-
-        // Phase 2: Prepare transforms using pre-computed definitions
-        let mut prepared_transforms = Vec::new();
-
-        for &(key, transform) in &transforms_to_process {
-            debug!(component_id = %key, "Preparing transform.");
-
-            let input_definitions = definitions_map
-                .remove(key)
-                .unwrap_or_default();
-
-            let merged_definition: Definition = input_definitions
+        // Process layer by layer — within each layer, all transforms run in parallel.
+        // After each layer, pre-compute outputs for that layer's transforms so
+        // the NEXT layer finds them in cache (eliminating thundering herd / cache stampede).
+        let mut schema_error = false;
+        for layer in 0..num_layers {
+            let layer_transforms: Vec<_> = transforms_to_process
                 .iter()
-                .map(|(_output_id, definition)| definition.clone())
-                .reduce(Definition::merge)
-                .unwrap_or_else(Definition::any);
+                .filter(|(key, _)| transform_layer.get(key) == Some(&layer))
+                .collect();
 
-            let span = error_span!(
-                "transform",
-                component_kind = "transform",
-                component_id = %key.id(),
-                component_type = %transform.inner.get_component_name(),
+            debug!(
+                layer = layer,
+                count = layer_transforms.len(),
+                "Processing schema layer."
             );
 
-            // Create a map of the outputs to the list of possible definitions from those outputs.
-            let schema_definitions = transform
-                .inner
-                .outputs(
-                    &TransformContext {
-                        enrichment_tables: enrichment_tables.clone(),
-                        metrics_storage: METRICS_STORAGE.clone(),
-                        schema: self.config.schema,
-                        ..Default::default()
-                    },
-                    &input_definitions,
-                )
-                .into_iter()
-                .map(|output| {
-                    let definitions = output.schema_definitions(self.config.schema.enabled);
-                    (output.port, definitions)
+            // Step 1: Resolve input definitions for all transforms in this layer.
+            // For layer 0, inputs are sources (no outputs() needed).
+            // For layer N>0, all upstream outputs are pre-cached from previous layers.
+            let layer_results: Vec<_> = layer_transforms
+                .par_iter()
+                .map(|&&(key, transform)| {
+                    let result = schema::input_definitions_concurrent(
+                        &transform.inputs,
+                        config,
+                        enrichment_tables_for_par.clone(),
+                        &concurrent_cache,
+                        &outputs_cache,
+                    );
+                    (key.clone(), result)
                 })
-                .collect::<HashMap<_, _>>();
+                .collect();
 
-            let context = TransformContext {
-                key: Some(key.clone()),
-                globals: self.config.global.clone(),
-                enrichment_tables: enrichment_tables.clone(),
-                metrics_storage: METRICS_STORAGE.clone(),
-                schema_definitions,
-                merged_schema_definition: merged_definition.clone(),
-                schema: self.config.schema,
-                extra_context: self.extra_context.clone(),
-            };
+            for (key, result) in layer_results {
+                match result {
+                    Ok(definitions) => {
+                        definitions_map.insert(key, definitions);
+                    }
+                    Err(_) => {
+                        schema_error = true;
+                    }
+                }
+            }
 
-            let node =
-                TransformNode::from_parts(key.clone(), &context, transform, &input_definitions);
+            if schema_error {
+                return;
+            }
 
-            prepared_transforms.push((key.clone(), transform, context, node, span));
+            // Step 2: Pre-compute outputs for this layer's transforms in parallel.
+            // This ensures the next layer gets instant cache hits when it references
+            // these transforms as inputs, instead of N threads racing to compute
+            // the same outputs simultaneously.
+            let layer_keys: Vec<_> = layer_transforms
+                .iter()
+                .map(|&&(key, _)| key)
+                .collect();
+
+            layer_keys.par_iter().for_each(|key| {
+                // Only compute if not already cached (shouldn't be, but safe check)
+                {
+                    let guard = outputs_cache.read().unwrap();
+                    if guard.contains_key(key) {
+                        return;
+                    }
+                }
+                if let Some(input_defs) = definitions_map.get(key) {
+                    if let Some(outputs) =
+                        config.transform_outputs(key, enrichment_tables_for_par.clone(), input_defs)
+                    {
+                        let mut guard = outputs_cache.write().unwrap();
+                        guard.insert((*key).clone(), outputs);
+                    }
+                }
+            });
         }
 
-        // Phase 2: Build transforms concurrently using FuturesUnordered
-        let mut build_futures = FuturesUnordered::new();
+        info!(
+            elapsed_ms = schema_start.elapsed().as_millis() as u64,
+            layers = num_layers,
+            "Schema definition resolution complete."
+        );
 
-        for (key, transform, context, node, span) in prepared_transforms {
+        // --- Transform context preparation (parallel via rayon) ---
+        // Builds TransformContext, TransformNode, and schema_definitions for each transform.
+        let preparation_start = Instant::now();
+        let config_schema = self.config.schema;
+        let config_global = &self.config.global;
+        let extra_context = &self.extra_context;
+
+        let prepared_transforms: Vec<_> = transforms_to_process
+            .par_iter()
+            .map(|&(key, transform)| {
+                debug!(component_id = %key, "Preparing transform.");
+
+                let input_definitions = definitions_map
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let merged_definition: Definition = input_definitions
+                    .iter()
+                    .map(|(_output_id, definition)| definition.clone())
+                    .reduce(Definition::merge)
+                    .unwrap_or_else(Definition::any);
+
+                let span = error_span!(
+                    "transform",
+                    component_kind = "transform",
+                    component_id = %key.id(),
+                    component_type = %transform.inner.get_component_name(),
+                );
+
+                // Create a map of the outputs to the list of possible definitions.
+                // Try the outputs cache first (populated during schema resolution),
+                // falling back to computing if not cached.
+                let transform_outputs = schema::get_cached_transform_outputs(
+                    &outputs_cache,
+                    key,
+                ).unwrap_or_else(|| {
+                    transform.inner.outputs(
+                        &TransformContext {
+                            enrichment_tables: enrichment_tables.clone(),
+                            metrics_storage: METRICS_STORAGE.clone(),
+                            schema: config_schema,
+                            ..Default::default()
+                        },
+                        &input_definitions,
+                    )
+                });
+
+                let schema_definitions = transform_outputs
+                    .into_iter()
+                    .map(|output| {
+                        let definitions = output.schema_definitions(config_schema.enabled);
+                        (output.port, definitions)
+                    })
+                    .collect::<HashMap<_, _>>();
+
+                let context = TransformContext {
+                    key: Some(key.clone()),
+                    globals: config_global.clone(),
+                    enrichment_tables: enrichment_tables.clone(),
+                    metrics_storage: METRICS_STORAGE.clone(),
+                    schema_definitions,
+                    merged_schema_definition: merged_definition.clone(),
+                    schema: config_schema,
+                    extra_context: extra_context.clone(),
+                };
+
+                let node =
+                    TransformNode::from_parts(key.clone(), &context, transform, &input_definitions);
+
+                // Clone the inner transform config so we can move it into a spawned task.
+                let inner_clone = transform.inner.clone();
+
+                (key.clone(), inner_clone, context, node, span)
+            })
+            .collect();
+
+        info!(
+            elapsed_ms = preparation_start.elapsed().as_millis() as u64,
+            "Transform context preparation complete."
+        );
+
+        // --- VRL compilation (parallel via tokio::task::spawn) ---
+        // Each transform.build() compiles VRL programs. Using tokio::task::spawn
+        // distributes work across all worker threads for true CPU parallelism.
+        let vrl_start = Instant::now();
+        let mut build_handles = Vec::with_capacity(prepared_transforms.len());
+
+        for (key, inner, context, node, span) in prepared_transforms {
             let key_clone = key.clone();
-            let build_future = async move {
-                let result = transform
-                    .inner
+            let handle = tokio::task::spawn(async move {
+                let result = inner
                     .build(&context)
                     .instrument(span.clone())
                     .await;
-                (key_clone, result, context, node, span)
-            };
-            build_futures.push(build_future);
+                (key_clone, result, node, span)
+            });
+            build_handles.push((key, handle));
         }
 
-        // Phase 3: Collect results and apply them
-        while let Some((key, result, _context, node, span)) = build_futures.next().await {
-            match result {
-                Err(error) => {
-                    self.errors.push(format!("Transform \"{key}\": {error}"));
+        // Collect results and wire up topology
+        for (key, handle) in build_handles {
+            match handle.await {
+                Err(join_error) => {
+                    self.errors.push(format!("Transform \"{key}\": task panicked: {join_error}"));
                     continue;
                 }
-                Ok(transform) => {
-                    let metrics = ChannelMetricMetadata::new(TRANSFORM_CHANNEL_METRIC_PREFIX, None);
-                    let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
-                        TOPOLOGY_BUFFER_SIZE,
-                        WhenFull::Block,
-                        &span,
-                        Some(metrics),
-                        self.config.global.buffer_utilization_ewma_alpha,
-                    );
+                Ok((_key, result, node, span)) => {
+                    match result {
+                        Err(error) => {
+                            self.errors.push(format!("Transform \"{key}\": {error}"));
+                            continue;
+                        }
+                        Ok(transform) => {
+                            let metrics = ChannelMetricMetadata::new(TRANSFORM_CHANNEL_METRIC_PREFIX, None);
+                            let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
+                                TOPOLOGY_BUFFER_SIZE,
+                                WhenFull::Block,
+                                &span,
+                                Some(metrics),
+                                self.config.global.buffer_utilization_ewma_alpha,
+                            );
 
-                    self.inputs
-                        .insert(key.clone(), (input_tx, node.inputs.clone()));
+                            self.inputs
+                                .insert(key.clone(), (input_tx, node.inputs.clone()));
 
-                    let (transform_task, transform_outputs) =
-                        build_transform(transform, node, input_rx, &self.utilization_registry);
+                            let (transform_task, transform_outputs) =
+                                build_transform(transform, node, input_rx, &self.utilization_registry);
 
-                    self.outputs.extend(transform_outputs);
-                    self.tasks.insert(key.clone(), transform_task);
+                            self.outputs.extend(transform_outputs);
+                            self.tasks.insert(key.clone(), transform_task);
+                        }
+                    }
                 }
             }
         }
+
+        info!(
+            elapsed_ms = vrl_start.elapsed().as_millis() as u64,
+            "VRL compilation and wiring complete."
+        );
+
+        info!(
+            total_elapsed_ms = build_transforms_start.elapsed().as_millis() as u64,
+            "Transform build pipeline finished."
+        );
     }
 
     async fn build_sinks(&mut self, enrichment_tables: &vector_lib::enrichment::TableRegistry) {

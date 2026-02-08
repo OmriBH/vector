@@ -10,6 +10,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Instant,
 };
 
 pub use config_builder::ConfigBuilderLoader;
@@ -215,11 +216,17 @@ pub async fn load_from_paths_with_provider_and_secrets(
         .await
         .map_err(|e| vec![e])?;
 
+    let load_start = Instant::now();
     let mut builder = ConfigBuilderLoader::default()
         .interpolate_env(interpolate_env)
         .allow_empty(allow_empty)
         .secrets(secrets)
         .load_from_paths(config_paths)?;
+
+    info!(
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        "Config file loading and parsing complete."
+    );
 
     validation::check_provider(&builder)?;
     signal_handler.clear();
