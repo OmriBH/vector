@@ -1,5 +1,7 @@
+# syntax=docker/dockerfile:1.7-labs
+
 # Multi-stage build for Vector with custom features (thin build)
-FROM docker.io/rust:1.87-bookworm AS builder
+FROM docker.io/rust:1.87-bookworm AS chef-base
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -17,8 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /vector
 
-# Copy the source code
-COPY . .
+ENV CARGO_HOME=/usr/local/cargo \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_INCREMENTAL=0
+
+# Install cargo-chef once and reuse it in later stages.
+RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    cargo install cargo-chef --locked
 
 # Build with specific features only (thin build)
 ENV CARGO_FEATURES="api,enrichment-tables,transforms,secrets,unix,\
@@ -29,7 +37,27 @@ sinks-aws_cloudwatch_logs,sinks-aws_cloudwatch_metrics,\
 sinks-console,sinks-datadog_logs,sinks-datadog_metrics,\
 sinks-blackhole,sinks-vector,sinks-prometheus"
 
-RUN cargo build --release --no-default-features --features "${CARGO_FEATURES}"
+# Compute dependency recipe from manifests.
+FROM chef-base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Compile dependencies from recipe. This layer is cached until manifests change.
+FROM chef-base AS deps
+COPY --from=planner /vector/recipe.json /vector/recipe.json
+RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=vector-target,target=/vector/target,sharing=locked \
+    cargo chef cook --release --locked --recipe-path recipe.json --no-default-features --features "${CARGO_FEATURES}"
+
+# Build app using cached dependencies.
+FROM chef-base AS builder
+COPY . .
+RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=vector-target,target=/vector/target,sharing=locked \
+    cargo build --release --locked --bin vector --no-default-features --features "${CARGO_FEATURES}" \
+    && install -D /vector/target/release/vector /vector/vector-bin
 
 # Runtime stage
 FROM docker.io/debian:bookworm-slim
@@ -44,7 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
-COPY --from=builder /vector/target/release/vector /usr/bin/vector
+COPY --from=builder /vector/vector-bin /usr/bin/vector
 
 # Smoke test
 RUN ["/usr/bin/vector", "--version"]
