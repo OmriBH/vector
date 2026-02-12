@@ -26,7 +26,8 @@ sources-file,sources-http_server,sources-http_client,sources-kafka,\
 sources-internal_logs,sources-internal_metrics,sources-vector,\
 sinks-clickhouse,sinks-file,sinks-http,sinks-kafka,\
 sinks-aws_cloudwatch_logs,sinks-aws_cloudwatch_metrics,\
-sinks-console,sinks-blackhole,sinks-vector,sinks-prometheus"
+sinks-console,sinks-datadog_logs,sinks-datadog_metrics,\
+sinks-blackhole,sinks-vector,sinks-prometheus"
 
 RUN cargo build --release --no-default-features --features "${CARGO_FEATURES}"
 

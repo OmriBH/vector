@@ -13,7 +13,8 @@ pub struct KafkaBytesReceived<'a> {
     pub byte_size: usize,
     pub protocol: &'static str,
     pub topic: &'a str,
-    pub partition: i32,
+    /// Pre-formatted partition string to avoid per-message allocation.
+    pub partition: &'a str,
 }
 
 impl InternalEvent for KafkaBytesReceived<'_> {
@@ -23,7 +24,7 @@ impl InternalEvent for KafkaBytesReceived<'_> {
             byte_size = %self.byte_size,
             protocol = %self.protocol,
             topic = self.topic,
-            partition = %self.partition,
+            partition = self.partition,
         );
         counter!(
             "component_received_bytes_total",
@@ -40,7 +41,8 @@ pub struct KafkaEventsReceived<'a> {
     pub byte_size: JsonSize,
     pub count: usize,
     pub topic: &'a str,
-    pub partition: i32,
+    /// Pre-formatted partition string to avoid per-frame allocation.
+    pub partition: &'a str,
 }
 
 impl InternalEvent for KafkaEventsReceived<'_> {
@@ -50,7 +52,7 @@ impl InternalEvent for KafkaEventsReceived<'_> {
             count = %self.count,
             byte_size = %self.byte_size,
             topic = self.topic,
-            partition = %self.partition,
+            partition = self.partition,
         );
         counter!(
             "component_received_events_total",

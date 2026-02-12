@@ -12,6 +12,9 @@ use crate::{
 
 pub struct KafkaRequestBuilder {
     pub key_field: Option<OwnedTargetPath>,
+    /// Pre-computed string form of `key_field` to avoid per-event allocation
+    /// during metric tag lookups.
+    pub key_field_str: Option<String>,
     pub headers_key: Option<OwnedTargetPath>,
     pub encoder: (Transformer, Encoder<()>),
 }
@@ -41,7 +44,7 @@ impl RequestBuilder<(String, Event)> for KafkaRequestBuilder {
 
         let metadata = KafkaRequestMetadata {
             finalizers: event.take_finalizers(),
-            key: get_key(&event, self.key_field.as_ref()),
+            key: get_key(&event, self.key_field.as_ref(), self.key_field_str.as_deref()),
             timestamp_millis: get_timestamp_millis(&event),
             headers: get_headers(&event, self.headers_key.as_ref()),
             topic,
@@ -64,13 +67,27 @@ impl RequestBuilder<(String, Event)> for KafkaRequestBuilder {
     }
 }
 
-fn get_key(event: &Event, key_field: Option<&OwnedTargetPath>) -> Option<Bytes> {
+fn get_key(
+    event: &Event,
+    key_field: Option<&OwnedTargetPath>,
+    key_field_str: Option<&str>,
+) -> Option<Bytes> {
     key_field.and_then(|key_field| match event {
         Event::Log(log) => log.get(key_field).map(|value| value.coerce_to_bytes()),
-        Event::Metric(metric) => metric
-            .tags()
-            .and_then(|tags| tags.get(key_field.to_string().as_str()))
-            .map(|value| value.to_owned().into()),
+        Event::Metric(metric) => {
+            let fallback;
+            let tag_key = match key_field_str {
+                Some(s) => s,
+                None => {
+                    fallback = key_field.to_string();
+                    fallback.as_str()
+                }
+            };
+            metric
+                .tags()
+                .and_then(|tags| tags.get(tag_key))
+                .map(|value| value.to_owned().into())
+        }
         _ => None,
     })
 }
