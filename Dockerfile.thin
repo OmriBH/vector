@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # Multi-stage build for Vector with custom features (thin build)
-FROM docker.io/rust:1.87-bookworm AS chef-base
+FROM docker.io/rust:1.92-bookworm AS chef-base
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /vector
 
 ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_INCREMENTAL=0
 
@@ -27,6 +28,14 @@ ENV CARGO_HOME=/usr/local/cargo \
 RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     cargo install cargo-chef --locked
+
+# Pre-resolve rust toolchain in its own cached layer.
+FROM chef-base AS toolchain
+COPY rust-toolchain.toml /vector/rust-toolchain.toml
+RUN --mount=type=cache,id=vector-rustup,target=/usr/local/rustup,sharing=locked \
+    rustup show active-toolchain \
+    && rustc --version \
+    && cargo --version
 
 # Build with specific features only (thin build)
 ENV CARGO_FEATURES="api,enrichment-tables,transforms,secrets,unix,\
@@ -38,12 +47,12 @@ sinks-console,sinks-datadog_logs,sinks-datadog_metrics,\
 sinks-blackhole,sinks-vector,sinks-prometheus"
 
 # Compute dependency recipe from manifests.
-FROM chef-base AS planner
+FROM toolchain AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Compile dependencies from recipe. This layer is cached until manifests change.
-FROM chef-base AS deps
+FROM toolchain AS deps
 COPY --from=planner /vector/recipe.json /vector/recipe.json
 RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -51,7 +60,7 @@ RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry
     cargo chef cook --release --locked --recipe-path recipe.json --no-default-features --features "${CARGO_FEATURES}"
 
 # Build app using cached dependencies.
-FROM chef-base AS builder
+FROM toolchain AS builder
 COPY . .
 RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
