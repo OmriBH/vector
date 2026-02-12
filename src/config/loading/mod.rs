@@ -7,8 +7,10 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     fs::{File, ReadDir},
+    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Instant,
 };
 
 pub use config_builder::ConfigBuilderLoader;
@@ -17,6 +19,7 @@ use loader::process::Process;
 pub use loader::*;
 pub use secret::*;
 pub use source::*;
+use toml::value::Table;
 use vector_lib::configurable::NamedComponent;
 
 use super::{
@@ -58,6 +61,61 @@ pub(super) fn open_file<P: AsRef<Path> + Debug>(path: P) -> Option<File> {
             }
         }
     }
+}
+
+/// Process a single config file: read, prepare (interpolate env vars and secrets), and parse to TOML Table.
+/// This is a standalone function that can be called from parallel contexts.
+pub(super) fn process_config_file(
+    path: &Path,
+    format: Format,
+    interpolate_env: bool,
+    secrets: &HashMap<String, String>,
+) -> Result<Option<(String, Table)>, Vec<String>> {
+    let name = match component_name(path) {
+        Ok(name) => name,
+        Err(_) => return Ok(None),
+    };
+
+    let mut file = match open_file(path) {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+
+    // Read file contents
+    let mut source_string = String::new();
+    file.read_to_string(&mut source_string)
+        .map_err(|e| vec![format!("Error reading file {:?}: {}", path, e)])?;
+
+    // Interpolate environment variables if enabled
+    let prepared = if interpolate_env {
+        let mut env_vars: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| match (k.into_string(), v.into_string()) {
+                (Ok(k), Ok(v)) => Some((k, v)),
+                _ => None,
+            })
+            .collect();
+
+        if !env_vars.contains_key("HOSTNAME")
+            && let Ok(hostname) = crate::get_hostname()
+        {
+            env_vars.insert("HOSTNAME".into(), hostname);
+        }
+        vars::interpolate(&source_string, &env_vars)?
+    } else {
+        source_string
+    };
+
+    // Interpolate secrets if any
+    let final_content = if secrets.is_empty() {
+        prepared
+    } else {
+        secret::interpolate(&prepared, secrets)?
+    };
+
+    // Parse to TOML Table
+    let table: Table = format::deserialize(&final_content, format)?;
+
+    Ok(Some((name, table)))
 }
 
 /// Merge the paths coming from different cli flags with different formats into
@@ -158,11 +216,17 @@ pub async fn load_from_paths_with_provider_and_secrets(
         .await
         .map_err(|e| vec![e])?;
 
+    let load_start = Instant::now();
     let mut builder = ConfigBuilderLoader::default()
         .interpolate_env(interpolate_env)
         .allow_empty(allow_empty)
         .secrets(secrets)
         .load_from_paths(config_paths)?;
+
+    info!(
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        "Config file loading and parsing complete."
+    );
 
     validation::check_provider(&builder)?;
     signal_handler.clear();
