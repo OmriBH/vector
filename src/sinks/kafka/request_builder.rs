@@ -1,3 +1,8 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock, RwLock},
+};
+
 use bytes::Bytes;
 use rdkafka::message::{Header, OwnedHeaders};
 use vector_lib::lookup::OwnedTargetPath;
@@ -12,9 +17,6 @@ use crate::{
 
 pub struct KafkaRequestBuilder {
     pub key_field: Option<OwnedTargetPath>,
-    /// Pre-computed string form of `key_field` to avoid per-event allocation
-    /// during metric tag lookups.
-    pub key_field_str: Option<String>,
     pub headers_key: Option<OwnedTargetPath>,
     pub encoder: (Transformer, Encoder<()>),
 }
@@ -44,7 +46,7 @@ impl RequestBuilder<(String, Event)> for KafkaRequestBuilder {
 
         let metadata = KafkaRequestMetadata {
             finalizers: event.take_finalizers(),
-            key: get_key(&event, self.key_field.as_ref(), self.key_field_str.as_deref()),
+            key: get_key(&event, self.key_field.as_ref()),
             timestamp_millis: get_timestamp_millis(&event),
             headers: get_headers(&event, self.headers_key.as_ref()),
             topic,
@@ -67,25 +69,41 @@ impl RequestBuilder<(String, Event)> for KafkaRequestBuilder {
     }
 }
 
+// Avoid allocating `key_field.to_string()` for every Metric event by caching the
+// string form once per unique `OwnedTargetPath` value.
+static KEY_FIELD_STR_CACHE: OnceLock<RwLock<HashMap<OwnedTargetPath, Arc<str>>>> = OnceLock::new();
+
+fn cached_key_field_str(key_field: &OwnedTargetPath) -> Arc<str> {
+    let cache = KEY_FIELD_STR_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    if let Ok(guard) = cache.read()
+        && let Some(s) = guard.get(key_field)
+    {
+        return Arc::clone(s);
+    }
+
+    let computed: Arc<str> = key_field.to_string().into();
+
+    // Double-checked insert to avoid overwriting if another thread raced ahead.
+    let mut guard = cache.write().expect("poisoned KEY_FIELD_STR_CACHE lock");
+    Arc::clone(
+        guard
+            .entry(key_field.clone())
+            .or_insert_with(|| Arc::clone(&computed)),
+    )
+}
+
 fn get_key(
     event: &Event,
     key_field: Option<&OwnedTargetPath>,
-    key_field_str: Option<&str>,
 ) -> Option<Bytes> {
     key_field.and_then(|key_field| match event {
         Event::Log(log) => log.get(key_field).map(|value| value.coerce_to_bytes()),
         Event::Metric(metric) => {
-            let fallback;
-            let tag_key = match key_field_str {
-                Some(s) => s,
-                None => {
-                    fallback = key_field.to_string();
-                    fallback.as_str()
-                }
-            };
+            let tag_key = cached_key_field_str(key_field);
             metric
                 .tags()
-                .and_then(|tags| tags.get(tag_key))
+                .and_then(|tags| tags.get(tag_key.as_ref()))
                 .map(|value| value.to_owned().into())
         }
         _ => None,
