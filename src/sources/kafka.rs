@@ -78,6 +78,10 @@ enum BuildError {
     CreateError { source: rdkafka::error::KafkaError },
     #[snafu(display("Could not subscribe to Kafka topics: {}", source))]
     SubscribeError { source: rdkafka::error::KafkaError },
+    #[snafu(display(
+        "librdkafka option `{key}` is not supported when `group.protocol=consumer` (KIP-848); remove it from `librdkafka_options`"
+    ))]
+    UnsupportedOptionForConsumerProtocol { key: String },
 }
 
 /// Metrics (beta) configuration.
@@ -1342,15 +1346,34 @@ fn create_consumer(
     StreamConsumer<KafkaSourceContext>,
     UnboundedReceiver<KafkaCallback>,
 )> {
+    let group_protocol_is_consumer = config
+        .librdkafka_options
+        .as_ref()
+        .and_then(|opts| opts.get("group.protocol"))
+        .map(|v| v.trim().eq_ignore_ascii_case("consumer"))
+        .unwrap_or(false);
+
+    if group_protocol_is_consumer {
+        if let Some(opts) = config.librdkafka_options.as_ref() {
+            // With KIP-848 (group.protocol=consumer), librdkafka rejects *explicit* classic
+            // protocol settings like `session.timeout.ms`/`heartbeat.interval.ms` even if
+            // they match defaults.
+            for key in ["session.timeout.ms", "heartbeat.interval.ms"] {
+                snafu::ensure!(
+                    !opts.contains_key(key),
+                    UnsupportedOptionForConsumerProtocolSnafu {
+                        key: key.to_string()
+                    }
+                );
+            }
+        }
+    }
+
     let mut client_config = ClientConfig::new();
     client_config
         .set("group.id", &config.group_id)
         .set("bootstrap.servers", &config.bootstrap_servers)
         .set("auto.offset.reset", &config.auto_offset_reset)
-        .set(
-            "session.timeout.ms",
-            config.session_timeout_ms.as_millis().to_string(),
-        )
         .set(
             "socket.timeout.ms",
             config.socket_timeout_ms.as_millis().to_string(),
@@ -1368,6 +1391,16 @@ fn create_consumer(
         .set("enable.auto.offset.store", "false")
         .set("statistics.interval.ms", "1000")
         .set("client.id", "vector");
+
+    // KIP-848 (group.protocol=consumer) does not allow setting `session.timeout.ms` at all.
+    // Vector historically sets it unconditionally from `session_timeout_ms`, which prevents
+    // enabling KIP-848 via `librdkafka_options` alone.
+    if !group_protocol_is_consumer {
+        client_config.set(
+            "session.timeout.ms",
+            config.session_timeout_ms.as_millis().to_string(),
+        );
+    }
 
     config.auth.apply(&mut client_config)?;
 
