@@ -9,6 +9,17 @@ use crate::{
     topology,
 };
 
+/// Thread-safe cache wrapper for concurrent schema definition computation.
+/// Uses RwLock because reads (cache hits) heavily outnumber writes (cache inserts),
+/// reducing contention compared to Mutex.
+pub(crate) type ConcurrentCache = std::sync::RwLock<Cache>;
+
+/// Cache for transform.inner.outputs() results keyed by (ComponentKey, input_definitions).
+/// Without this, if transform U feeds into 50 downstream transforms,
+/// U.inner.outputs() would be called 50 times. With this cache, it's called once.
+pub(crate) type TransformOutputsCache =
+    std::sync::RwLock<HashMap<ComponentKey, Vec<TransformOutput>>>;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     ContainsNever,
@@ -29,7 +40,8 @@ pub fn possible_definitions(
     }
 
     // Try to get the definition from the cache.
-    if let Some(definition) = cache.get(&(config.schema_enabled(), inputs.to_vec())) {
+    let cache_key = (config.schema_enabled(), inputs.to_vec());
+    if let Some(definition) = cache.get(&cache_key) {
         return Ok(definition.clone());
     }
 
@@ -90,6 +102,9 @@ pub fn possible_definitions(
             definitions.append(&mut transform_definition);
         }
     }
+
+    // Cache the result to avoid redundant traversals
+    cache.insert(cache_key, definitions.clone());
 
     Ok(definitions)
 }
@@ -206,6 +221,7 @@ pub(super) fn expanded_definitions(
 /// Returns a list of definitions from the given inputs.
 /// Errors if any of the definitions are [`Kind::never`] implying that
 /// an error condition has been reached.
+#[allow(dead_code)]
 pub(crate) fn input_definitions(
     inputs: &[OutputId],
     config: &Config,
@@ -216,7 +232,8 @@ pub(crate) fn input_definitions(
         return Ok(vec![]);
     }
 
-    if let Some(definitions) = cache.get(&(config.schema_enabled(), inputs.to_vec())) {
+    let cache_key = (config.schema_enabled(), inputs.to_vec());
+    if let Some(definitions) = cache.get(&cache_key) {
         return Ok(definitions.clone());
     }
 
@@ -284,7 +301,138 @@ pub(crate) fn input_definitions(
         }
     }
 
+    // Cache the result to avoid redundant recursive traversals
+    cache.insert(cache_key, definitions.clone());
+
     Ok(definitions)
+}
+
+/// Thread-safe version of [`input_definitions`] for parallel pre-computation.
+///
+/// Uses a `RwLock<Cache>` so multiple rayon threads can compute definitions
+/// concurrently. The read lock allows many threads to check the cache simultaneously,
+/// while the write lock is held only briefly for cache inserts.
+/// Locks are never held across recursive calls, so there is no deadlock risk.
+///
+/// The `outputs_cache` caches `transform.inner.outputs()` results per ComponentKey.
+/// Without it, if transform U feeds into N downstream transforms, U.inner.outputs()
+/// would be called N times. With the cache, it's called once.
+pub(crate) fn input_definitions_concurrent(
+    inputs: &[OutputId],
+    config: &Config,
+    enrichment_tables: vector_lib::enrichment::TableRegistry,
+    cache: &ConcurrentCache,
+    outputs_cache: &TransformOutputsCache,
+) -> Result<Vec<(OutputId, Definition)>, Error> {
+    if inputs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let cache_key = (config.schema_enabled(), inputs.to_vec());
+
+    // Read lock - many threads can check cache simultaneously
+    {
+        let cache_guard = cache.read().unwrap();
+        if let Some(definitions) = cache_guard.get(&cache_key) {
+            return Ok(definitions.clone());
+        }
+    }
+
+    let mut definitions = Vec::new();
+
+    for input in inputs {
+        let key = &input.component;
+
+        if let Ok(maybe_output) = config.source_output_for_port(key, &input.port) {
+            let mut source_definitions = input.with_definitions(
+                maybe_output
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "source output mis-configured - output for port {:?} missing",
+                            &input.port
+                        )
+                    })
+                    .schema_definition(config.schema_enabled()),
+            );
+
+            if contains_never(&source_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut source_definitions);
+        }
+
+        if let Some(inputs) = config.transform_inputs(key) {
+            // Recursive call - no lock held, so no deadlock
+            let transform_definitions =
+                input_definitions_concurrent(inputs, config, enrichment_tables.clone(), cache, outputs_cache)?;
+
+            if contains_never(&transform_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            // Check the transform outputs cache first to avoid redundant
+            // transform.inner.outputs() calls
+            let cached_outputs = {
+                let guard = outputs_cache.read().unwrap();
+                guard.get(key).cloned()
+            };
+
+            let all_outputs = if let Some(outputs) = cached_outputs {
+                outputs
+            } else {
+                // Compute and cache
+                let outputs = config
+                    .transform_outputs(key, enrichment_tables.clone(), &transform_definitions)
+                    .expect("transform must exist - already found inputs");
+                let mut guard = outputs_cache.write().unwrap();
+                guard.insert(key.clone(), outputs.clone());
+                outputs
+            };
+
+            // Find the output matching the requested port
+            let matching_output = all_outputs
+                .into_iter()
+                .find(|output| &output.port == &input.port)
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "transform output mis-configured - output for port {:?} missing",
+                        &input.port
+                    )
+                });
+
+            let mut transform_definitions = input.with_definitions(
+                matching_output
+                    .schema_definitions(config.schema_enabled())
+                    .values()
+                    .cloned(),
+            );
+
+            if contains_never(&transform_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut transform_definitions);
+        }
+    }
+
+    // Brief write lock to insert into cache
+    {
+        let mut cache_guard = cache.write().unwrap();
+        cache_guard.insert(cache_key, definitions.clone());
+    }
+
+    Ok(definitions)
+}
+
+/// Look up cached transform outputs. Returns the outputs if cached, or None.
+/// Used by the context preparation phase to avoid recomputing transform.inner.outputs().
+pub(crate) fn get_cached_transform_outputs(
+    outputs_cache: &TransformOutputsCache,
+    key: &ComponentKey,
+) -> Option<Vec<TransformOutput>> {
+    let guard = outputs_cache.read().unwrap();
+    guard.get(key).cloned()
 }
 
 /// Checks if any of the definitions in the list contain `Kind::never()`. This
