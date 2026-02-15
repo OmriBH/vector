@@ -72,8 +72,10 @@ impl KafkaSink {
     }
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+        let key_field_str = self.key_field.as_ref().map(|k| k.to_string());
         let request_builder = KafkaRequestBuilder {
             key_field: self.key_field,
+            key_field_str,
             headers_key: self.headers_key,
             encoder: (self.transformer, self.encoder),
         };
