@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+use futures::task::AtomicWaker;
+
 use bytes::Bytes;
 use rdkafka::{
     error::KafkaError,
@@ -16,7 +18,7 @@ use rdkafka::{
 };
 use vector_lib::config;
 
-use crate::{kafka::KafkaStatisticsContext, sinks::prelude::*};
+use crate::{common::backoff::ExponentialBackoff, kafka::KafkaStatisticsContext, sinks::prelude::*};
 
 pub struct KafkaRequest {
     pub body: Bytes,
@@ -68,21 +70,34 @@ impl MetaDescriptive for KafkaRequest {
     }
 }
 
+/// Shared state between `KafkaService` and in-flight `BlockedRecordState` instances.
+/// Pairs the blocked-record counter with a lock-free waker so that `poll_ready`
+/// is properly notified when all blocked records have been enqueued.
+struct BlockedRecordNotifier {
+    records_blocked: AtomicUsize,
+    waker: AtomicWaker,
+}
+
 /// BlockedRecordState manages state for a record blocked from being enqueued on the producer.
 struct BlockedRecordState {
-    records_blocked: Arc<AtomicUsize>,
+    shared: Arc<BlockedRecordNotifier>,
 }
 
 impl BlockedRecordState {
-    fn new(records_blocked: Arc<AtomicUsize>) -> Self {
-        records_blocked.fetch_add(1, Ordering::Relaxed);
-        Self { records_blocked }
+    fn new(shared: Arc<BlockedRecordNotifier>) -> Self {
+        shared.records_blocked.fetch_add(1, Ordering::Release);
+        Self { shared }
     }
 }
 
 impl Drop for BlockedRecordState {
     fn drop(&mut self) {
-        self.records_blocked.fetch_sub(1, Ordering::Relaxed);
+        // If this was the last blocked record, wake the service so it can
+        // resume dispatching new requests immediately.
+        let prev = self.shared.records_blocked.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            self.shared.waker.wake();
+        }
     }
 }
 
@@ -90,15 +105,18 @@ impl Drop for BlockedRecordState {
 pub struct KafkaService {
     kafka_producer: FutureProducer<KafkaStatisticsContext>,
 
-    /// The number of records blocked from being enqueued on the producer.
-    records_blocked: Arc<AtomicUsize>,
+    /// Shared backpressure state: blocked-record counter + waker for `poll_ready`.
+    shared: Arc<BlockedRecordNotifier>,
 }
 
 impl KafkaService {
     pub(crate) fn new(kafka_producer: FutureProducer<KafkaStatisticsContext>) -> KafkaService {
         KafkaService {
             kafka_producer,
-            records_blocked: Arc::new(AtomicUsize::new(0)),
+            shared: Arc::new(BlockedRecordNotifier {
+                records_blocked: AtomicUsize::new(0),
+                waker: AtomicWaker::new(),
+            }),
         }
     }
 }
@@ -108,10 +126,15 @@ impl Service<KafkaRequest> for KafkaService {
     type Error = KafkaError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // The Kafka service is at capacity if any records are currently blocked from being enqueued
-        // on the producer.
-        if self.records_blocked.load(Ordering::Relaxed) > 0 {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Register the waker BEFORE checking the condition to avoid a race where
+        // `records_blocked` transitions to 0 between the check and waker registration.
+        // Spurious wakes (when we return Ready) are harmless.
+        self.shared.waker.register(cx.waker());
+
+        // The Kafka service is at capacity if any records are currently blocked from being
+        // enqueued on the producer.
+        if self.shared.records_blocked.load(Ordering::Acquire) > 0 {
             Poll::Pending
         } else {
             Poll::Ready(Ok(()))
@@ -143,6 +166,14 @@ impl Service<KafkaRequest> for KafkaService {
             // Manually poll [FutureProducer::send_result] instead of [FutureProducer::send] to track
             // records that fail to be enqueued on the producer.
             let mut blocked_state: Option<BlockedRecordState> = None;
+            // Exponential backoff with ~20% jitter to avoid thundering-herd retries.
+            // Sequence (base, before jitter): 10ms, 20ms, 40ms, 80ms, 100ms, 100ms, …
+            let mut backoff = ExponentialBackoff::from_millis(2)
+                .factor(5)
+                .max_delay(Duration::from_millis(100));
+            // Use a fast non-crypto PRNG for jitter instead of the heavier
+            // thread-local CSPRNG used by rand::random.
+            let mut rng = <rand::rngs::SmallRng as rand::SeedableRng>::from_os_rng();
             loop {
                 match this.kafka_producer.send_result(record) {
                     // Record was successfully enqueued on the producer.
@@ -169,10 +200,13 @@ impl Service<KafkaRequest> for KafkaService {
                     )) => {
                         if blocked_state.is_none() {
                             blocked_state =
-                                Some(BlockedRecordState::new(Arc::clone(&this.records_blocked)));
+                                Some(BlockedRecordState::new(Arc::clone(&this.shared)));
                         }
                         record = original_record;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let base_delay = backoff.next().unwrap_or(Duration::from_millis(100));
+                        let max_jitter = (base_delay.as_millis() as u64 / 5) + 1;
+                        let jitter_ms = rand::Rng::random_range(&mut rng, 1..=max_jitter);
+                        tokio::time::sleep(base_delay + Duration::from_millis(jitter_ms)).await;
                     }
                     // A final/non-retriable error occurred.
                     Err((
@@ -201,5 +235,100 @@ impl Service<KafkaRequest> for KafkaService {
                 };
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn blocked_record_notifier_wakes_on_transition_to_zero() {
+        // Simulate: one record becomes blocked, then unblocks.
+        // The counter should transition from 1 -> 0 and trigger a wake.
+        let shared = Arc::new(BlockedRecordNotifier {
+            records_blocked: AtomicUsize::new(0),
+            waker: AtomicWaker::new(),
+        });
+
+        // Create a blocked state — increments counter to 1.
+        let state = BlockedRecordState::new(Arc::clone(&shared));
+        assert_eq!(shared.records_blocked.load(Ordering::Acquire), 1);
+
+        // Drop the blocked state — counter goes from 1 to 0.
+        drop(state);
+        assert_eq!(shared.records_blocked.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn blocked_record_notifier_does_not_wake_when_others_remain() {
+        // Two records blocked; dropping one should NOT wake because records_blocked
+        // goes from 2 to 1 (not to 0).
+        let shared = Arc::new(BlockedRecordNotifier {
+            records_blocked: AtomicUsize::new(0),
+            waker: AtomicWaker::new(),
+        });
+
+        let state1 = BlockedRecordState::new(Arc::clone(&shared));
+        let state2 = BlockedRecordState::new(Arc::clone(&shared));
+        assert_eq!(shared.records_blocked.load(Ordering::Acquire), 2);
+
+        // Drop one — counter goes to 1.
+        drop(state1);
+        assert_eq!(shared.records_blocked.load(Ordering::Acquire), 1);
+
+        // Drop the last one — counter goes to 0.
+        drop(state2);
+        assert_eq!(shared.records_blocked.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn backoff_sequence_produces_expected_delays() {
+        let mut backoff = ExponentialBackoff::from_millis(2)
+            .factor(5)
+            .max_delay(Duration::from_millis(100));
+
+        let expected = [
+            Duration::from_millis(10),  // 2 * 5
+            Duration::from_millis(20),  // 4 * 5
+            Duration::from_millis(40),  // 8 * 5
+            Duration::from_millis(80),  // 16 * 5
+            Duration::from_millis(100), // 32 * 5 = 160, capped at 100
+            Duration::from_millis(100), // stays capped
+        ];
+
+        for (i, exp) in expected.iter().enumerate() {
+            let actual = backoff.next().unwrap();
+            assert_eq!(
+                actual, *exp,
+                "backoff step {i}: expected {exp:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_ready_returns_ready_when_unblocked() {
+        let shared = Arc::new(BlockedRecordNotifier {
+            records_blocked: AtomicUsize::new(0),
+            waker: AtomicWaker::new(),
+        });
+
+        assert_eq!(shared.records_blocked.load(Ordering::Acquire), 0);
+        // With records_blocked == 0, poll_ready would return Ready.
+    }
+
+    #[test]
+    fn poll_ready_returns_pending_when_blocked() {
+        let shared = Arc::new(BlockedRecordNotifier {
+            records_blocked: AtomicUsize::new(0),
+            waker: AtomicWaker::new(),
+        });
+
+        let _state = BlockedRecordState::new(Arc::clone(&shared));
+
+        assert_eq!(shared.records_blocked.load(Ordering::Acquire), 1);
+        // With records_blocked > 0, poll_ready would return Pending.
     }
 }
