@@ -62,7 +62,25 @@ pub(crate) static SOURCE_SENDER_BUFFER_SIZE: LazyLock<usize> =
     LazyLock::new(|| *TRANSFORM_CONCURRENCY_LIMIT * CHUNK_SIZE);
 
 const READY_ARRAY_CAPACITY: NonZeroUsize = NonZeroUsize::new(CHUNK_SIZE * 4).unwrap();
-pub(crate) const TOPOLOGY_BUFFER_SIZE: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+pub(crate) static TOPOLOGY_BUFFER_SIZE: LazyLock<NonZeroUsize> = LazyLock::new(|| {
+    // Inter-transform channels buffer `EventArray` batches (not individual events).
+    // This is intentionally an env var so operators can tune burst tolerance vs memory/latency.
+    const DEFAULT: NonZeroUsize = NonZeroUsize::new(100).expect("static");
+
+    match std::env::var("VECTOR_TOPOLOGY_BUFFER_SIZE") {
+        Ok(value) => match value.parse::<NonZeroUsize>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                warn!(
+                    value = %value,
+                    "Invalid VECTOR_TOPOLOGY_BUFFER_SIZE, using default."
+                );
+                DEFAULT
+            }
+        },
+        Err(_) => DEFAULT,
+    }
+});
 const TRANSFORM_CHANNEL_METRIC_PREFIX: &str = "transform_buffer";
 
 static TRANSFORM_CONCURRENCY_LIMIT: LazyLock<usize> = LazyLock::new(|| {
@@ -726,7 +744,7 @@ impl<'a> Builder<'a> {
                         Ok(transform) => {
                             let metrics = ChannelMetricMetadata::new(TRANSFORM_CHANNEL_METRIC_PREFIX, None);
                             let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
-                                TOPOLOGY_BUFFER_SIZE,
+                                *TOPOLOGY_BUFFER_SIZE,
                                 WhenFull::Block,
                                 &span,
                                 Some(metrics),
