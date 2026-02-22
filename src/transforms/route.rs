@@ -169,6 +169,19 @@ impl TransformConfig for RouteConfig {
         result
     }
 
+    fn output_ports(&self) -> Option<Vec<Option<String>>> {
+        let mut ports = self
+            .route
+            .keys()
+            .cloned()
+            .map(Some)
+            .collect::<Vec<Option<String>>>();
+        if self.reroute_unmatched {
+            ports.push(Some(UNMATCHED_ROUTE.to_string()));
+        }
+        Some(ports)
+    }
+
     fn enable_concurrency(&self) -> bool {
         true
     }
@@ -183,13 +196,45 @@ mod test {
 
     use super::*;
     use crate::{
-        config::{ConfigBuilder, build_unit_tests},
+        config::{ConfigBuilder, TransformConfig, build_unit_tests},
         test_util::components::{COMPONENT_MULTIPLE_OUTPUTS_TESTS, init_test},
     };
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<super::RouteConfig>();
+    }
+
+    #[test]
+    fn lightweight_output_ports_match_config() {
+        let config = RouteConfig {
+            reroute_unmatched: true,
+            route: IndexMap::from([
+                (
+                    "first".to_owned(),
+                    AnyCondition::Map(ConditionConfig::Vrl(VrlConfig {
+                        source: ".message == \"a\"".to_owned(),
+                        ..Default::default()
+                    })),
+                ),
+                (
+                    "second".to_owned(),
+                    AnyCondition::Map(ConditionConfig::Vrl(VrlConfig {
+                        source: ".message == \"b\"".to_owned(),
+                        ..Default::default()
+                    })),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            TransformConfig::output_ports(&config),
+            Some(vec![
+                Some("first".to_owned()),
+                Some("second".to_owned()),
+                Some(UNMATCHED_ROUTE.to_owned()),
+            ])
+        );
     }
 
     #[test]

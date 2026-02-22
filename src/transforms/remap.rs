@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use snafu::{ResultExt, Snafu};
@@ -160,7 +160,7 @@ pub struct RemapConfig {
     /// Cache can't be `BTreeMap` or `HashMap` because of `TableRegistry`, which doesn't allow us to inspect tables inside it.
     /// And even if we allowed the inspection, the tables can be huge, resulting in a long comparison or hash computation
     /// while using `Vec` allows us to use just a shallow comparison
-    pub cache: Mutex<Vec<(CacheKey, std::result::Result<CacheValue, String>)>>,
+    pub cache: Arc<Mutex<Vec<(CacheKey, std::result::Result<CacheValue, String>)>>>,
 }
 
 impl Clone for RemapConfig {
@@ -175,7 +175,7 @@ impl Clone for RemapConfig {
             drop_on_abort: self.drop_on_abort,
             reroute_dropped: self.reroute_dropped,
             runtime: self.runtime,
-            cache: Mutex::new(Default::default()),
+            cache: self.cache.clone(),
         }
     }
 }
@@ -383,6 +383,14 @@ impl TransformConfig for RemapConfig {
         } else {
             vec![default_output]
         }
+    }
+
+    fn output_ports(&self) -> Option<Vec<Option<String>>> {
+        let mut ports = vec![None];
+        if self.reroute_dropped {
+            ports.push(Some(DROPPED.to_string()));
+        }
+        Some(ports)
     }
 
     fn enable_concurrency(&self) -> bool {
@@ -682,7 +690,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{ConfigBuilder, build_unit_tests},
+        config::{ConfigBuilder, TransformConfig, build_unit_tests},
         event::{
             LogEvent, Metric, Value,
             metric::{MetricKind, MetricValue},
@@ -730,6 +738,20 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<RemapConfig>();
+    }
+
+    #[test]
+    fn lightweight_output_ports_match_config() {
+        let config = RemapConfig {
+            source: Some(".foo = .bar".to_owned()),
+            reroute_dropped: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            TransformConfig::output_ports(&config),
+            Some(vec![None, Some(DROPPED.to_owned())])
+        );
     }
 
     #[test]

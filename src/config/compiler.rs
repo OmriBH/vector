@@ -5,7 +5,8 @@ use rayon::prelude::*;
 use vector_lib::id::Inputs;
 
 use super::{
-    Config, builder::ConfigBuilder, graph::Graph, transform::get_transform_output_ids, validation,
+    Config, builder::ConfigBuilder, graph::Graph,
+    transform::get_transform_output_ids_lightweight, validation,
 };
 
 pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<String>> {
@@ -270,7 +271,7 @@ pub(crate) fn expand_globs(config: &mut ConfigBuilder) {
                 MULTI_OUTPUT_TYPES.contains(&name)
             })
             .flat_map(|(key, t)| {
-                get_transform_output_ids(
+                get_transform_output_ids_lightweight(
                     t.inner.as_ref(),
                     key.clone(),
                     config.schema.log_namespace(),
@@ -366,7 +367,7 @@ fn expand_globs_inner(inputs: &mut Inputs<String>, id: &str, candidates: &IndexS
 
 #[cfg(test)]
 mod test {
-    use vector_lib::config::ComponentKey;
+    use vector_lib::config::{ComponentKey, OutputId};
 
     use super::*;
     use crate::test_util::mock::{basic_sink, basic_source, basic_transform};

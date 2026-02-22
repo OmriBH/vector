@@ -160,6 +160,16 @@ impl TransformConfig for ExclusiveRouteConfig {
         outputs
     }
 
+    fn output_ports(&self) -> Option<Vec<Option<String>>> {
+        let mut ports = self
+            .routes
+            .iter()
+            .map(|route| Some(route.name.clone()))
+            .collect::<Vec<Option<String>>>();
+        ports.push(Some(UNMATCHED_ROUTE.to_string()));
+        Some(ports)
+    }
+
     fn enable_concurrency(&self) -> bool {
         true
     }
@@ -170,6 +180,7 @@ mod tests {
     use indoc::indoc;
 
     use super::ExclusiveRouteConfig;
+    use crate::config::TransformConfig;
 
     #[test]
     fn generate_config() {
@@ -192,6 +203,27 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&config).unwrap(),
             r#"{"routes":[{"name":"a","condition":"type = \"vrl\" source = '.message == \"hello world\"'"}]}"#
+        );
+    }
+
+    #[test]
+    fn lightweight_output_ports_match_config() {
+        let config = ExclusiveRouteConfig {
+            routes: vec![super::Route {
+                name: "a".to_owned(),
+                condition: super::AnyCondition::Map(super::ConditionConfig::Vrl(super::VrlConfig {
+                    source: ".message == \"hello world\"".to_owned(),
+                    ..Default::default()
+                })),
+            }],
+        };
+
+        assert_eq!(
+            TransformConfig::output_ports(&config),
+            Some(vec![
+                Some("a".to_owned()),
+                Some(super::UNMATCHED_ROUTE.to_owned()),
+            ])
         );
     }
 }

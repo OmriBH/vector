@@ -7,7 +7,7 @@ use vector_lib::{buffers::config::DiskUsage, internal_event::DEFAULT_OUTPUT};
 
 use super::{
     ComponentKey, Config, OutputId, Resource, builder::ConfigBuilder,
-    transform::get_transform_output_ids,
+    transform::get_transform_output_ids_lightweight,
 };
 use crate::config::schema;
 
@@ -194,7 +194,7 @@ pub fn check_outputs(config: &ConfigBuilder) -> Result<(), Vec<String>> {
             errors.extend(errs.into_iter().map(|msg| format!("Transform {key} {msg}")));
         }
 
-        if get_transform_output_ids(
+        if get_transform_output_ids_lightweight(
             transform.inner.as_ref(),
             key.clone(),
             config.schema.log_namespace(),
@@ -369,7 +369,7 @@ pub fn warnings(config: &Config) -> Vec<String> {
                 .collect::<Vec<_>>()
         });
     let transform_ids = config.transforms.iter().flat_map(|(key, transform)| {
-        get_transform_output_ids(
+        get_transform_output_ids_lightweight(
             transform.inner.as_ref(),
             key.clone(),
             config.schema.log_namespace(),

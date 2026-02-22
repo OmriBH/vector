@@ -219,6 +219,17 @@ pub trait TransformConfig: DynClone + NamedComponent + core::fmt::Debug + Send +
         input_definitions: &[(OutputId, schema::Definition)],
     ) -> Vec<TransformOutput>;
 
+    /// Gets lightweight output port names exposed by this transform.
+    ///
+    /// This is intended for call sites that only need output identifiers/port names and do not
+    /// require schema inference. Transforms may override this to avoid expensive work in
+    /// `outputs(...)` such as schema propagation or program compilation.
+    ///
+    /// Returning `None` falls back to deriving ports from `outputs(...)`.
+    fn output_ports(&self) -> Option<Vec<Option<String>>> {
+        None
+    }
+
     /// Validates that the configuration of the transform is valid.
     ///
     /// This would generally be where logical conditions were checked, such as ensuring a transform
@@ -287,4 +298,30 @@ pub fn get_transform_output_ids<T: TransformConfig + ?Sized>(
             component: key.clone(),
             port: output.port,
         })
+}
+
+/// Lightweight output-id discovery for transforms.
+///
+/// Unlike `get_transform_output_ids`, this helper allows transforms to provide port names without
+/// invoking full `outputs(...)` inference. If the transform does not implement `output_ports()`,
+/// this falls back to `get_transform_output_ids`.
+pub fn get_transform_output_ids_lightweight<T: TransformConfig + ?Sized>(
+    transform: &T,
+    key: ComponentKey,
+    global_log_namespace: LogNamespace,
+) -> impl Iterator<Item = OutputId> + '_ {
+    if let Some(ports) = transform.output_ports() {
+        ports
+            .into_iter()
+            .map(move |port| OutputId {
+                component: key.clone(),
+                port,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    } else {
+        get_transform_output_ids(transform, key, global_log_namespace)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
 }
