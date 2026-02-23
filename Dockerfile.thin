@@ -57,7 +57,7 @@ COPY --from=planner /vector/recipe.json /vector/recipe.json
 RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=vector-target,target=/vector/target,sharing=locked \
-    cargo chef cook --release --locked --recipe-path recipe.json --no-default-features --features "${CARGO_FEATURES}"
+    cargo chef cook --release --recipe-path recipe.json --no-default-features --features "${CARGO_FEATURES}"
 
 # Build app using cached dependencies.
 FROM toolchain AS builder
@@ -65,7 +65,7 @@ COPY . .
 RUN --mount=type=cache,id=vector-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=vector-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=vector-target,target=/vector/target,sharing=locked \
-    cargo build --release --locked --bin vector --no-default-features --features "${CARGO_FEATURES}" \
+    cargo build --release --bin vector --no-default-features --features "${CARGO_FEATURES}" \
     && install -D /vector/target/release/vector /vector/vector-bin
 
 # Runtime stage

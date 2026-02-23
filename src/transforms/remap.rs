@@ -3,7 +3,8 @@ use std::{
     fs::File,
     io::{self, Read},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
+    time::Instant,
 };
 
 use snafu::{ResultExt, Snafu};
@@ -21,7 +22,7 @@ use vector_vrl_functions::set_semantic_meaning::MeaningList;
 use vector_vrl_metrics::MetricsStorage;
 use vrl::{
     compiler::{
-        CompileConfig, ExpressionError, Program, TypeState, VrlRuntime,
+        CompileConfig, ExpressionError, Function, Program, TypeState, VrlRuntime,
         runtime::{Runtime, Terminate},
         state::ExternalEnv,
     },
@@ -30,6 +31,9 @@ use vrl::{
     path::ValuePath,
     value::{Kind, Value},
 };
+
+static VRL_FUNCTION_TABLE: LazyLock<Vec<Box<dyn Function>>> =
+    LazyLock::new(vector_vrl_functions::all);
 
 use crate::{
     Result,
@@ -225,7 +229,8 @@ impl RemapConfig {
         config.set_custom(metrics_storage);
         config.set_custom(MeaningList::default());
 
-        let res = compile_vrl(&source, &vector_vrl_functions::all(), &state, config)
+        let compile_start = Instant::now();
+        let res = compile_vrl(&source, &VRL_FUNCTION_TABLE, &state, config)
             .map_err(|diagnostics| format_vrl_diagnostics(&source, diagnostics))
             .map(|result| {
                 (
@@ -234,6 +239,12 @@ impl RemapConfig {
                     result.config.get_custom::<MeaningList>().unwrap().clone(),
                 )
             });
+        let compile_elapsed = compile_start.elapsed();
+        debug!(
+            compile_ms = compile_elapsed.as_millis() as u64,
+            source_bytes = source.len(),
+            "VRL program compiled.",
+        );
 
         self.cache
             .lock()

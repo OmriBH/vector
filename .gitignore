@@ -62,5 +62,8 @@ volumes/
 *.env
 .env.*
 
+# Vendored dependencies
+vendor/
+
 # LLM tools
 copilot-instructions.md

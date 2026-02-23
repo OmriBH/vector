@@ -591,12 +591,13 @@ pub(super) fn validate_sink_expectations(
 ) -> Result<(), Vec<String>> {
     let mut errors = vec![];
 
-    // Get the schema against which we need to validate the schemas of the components feeding into
-    // this sink.
     let input = sink.inner.input();
     let requirement = input.schema_requirement();
 
-    // Get all pipeline definitions feeding into this sink.
+    if requirement.is_empty() {
+        return Ok(());
+    }
+
     let mut cache = HashMap::default();
     let definitions =
         match expanded_definitions(enrichment_tables, &sink.inputs, config, &mut cache) {
