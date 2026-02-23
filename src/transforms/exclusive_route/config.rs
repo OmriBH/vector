@@ -170,6 +170,16 @@ impl TransformConfig for ExclusiveRouteConfig {
         Some(ports)
     }
 
+    fn output_port_types(&self) -> Option<Vec<(Option<String>, DataType)>> {
+        let mut outputs = self
+            .routes
+            .iter()
+            .map(|route| (Some(route.name.clone()), DataType::all_bits()))
+            .collect::<Vec<_>>();
+        outputs.push((Some(UNMATCHED_ROUTE.to_string()), DataType::all_bits()));
+        Some(outputs)
+    }
+
     fn enable_concurrency(&self) -> bool {
         true
     }

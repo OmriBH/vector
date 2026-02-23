@@ -1,6 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use indexmap::{IndexMap, set::IndexSet};
@@ -8,7 +12,7 @@ use rayon::prelude::*;
 
 use super::{
     ComponentKey, DataType, OutputId, SinkOuter, SourceOuter, SourceOutput, TransformContext,
-    TransformOuter, TransformOutput, WildcardMatching, schema,
+    TransformOuter, WildcardMatching, schema,
 };
 
 #[derive(Debug, Clone)]
@@ -18,7 +22,7 @@ pub enum Node {
     },
     Transform {
         in_ty: DataType,
-        outputs: Vec<TransformOutput>,
+        outputs: Vec<(Option<String>, DataType)>,
     },
     Sink {
         ty: DataType,
@@ -40,8 +44,8 @@ impl fmt::Display for Node {
                     f,
                     "component_kind: source\n  input_types: {in_ty}\n  outputs:"
                 )?;
-                for output in outputs {
-                    write!(f, "\n    {output}")?;
+                for (port, ty) in outputs {
+                    write!(f, "\n    port: {:?}, type: {}", port, ty)?;
                 }
                 Ok(())
             }
@@ -112,24 +116,45 @@ impl Graph {
             .collect();
 
         // Transform nodes
+        let fast_path_count = Arc::new(AtomicU64::new(0));
+        let fallback_count = Arc::new(AtomicU64::new(0));
         let transform_nodes: Vec<_> = transforms
             .par_iter()
             .map(|(id, transform)| {
-                (
-                    id.clone(),
-                    Node::Transform {
-                        in_ty: transform.inner.input().data_type(),
-                        outputs: transform.inner.outputs(
+                let output_specs = if let Some(specs) = transform.inner.output_port_types() {
+                    fast_path_count.fetch_add(1, Ordering::Relaxed);
+                    specs
+                } else {
+                    fallback_count.fetch_add(1, Ordering::Relaxed);
+                    transform
+                        .inner
+                        .outputs(
                             &TransformContext {
                                 schema,
                                 ..Default::default()
                             },
                             &[(id.into(), schema::Definition::any())],
-                        ),
+                        )
+                        .into_iter()
+                        .map(|output| (output.port, output.ty))
+                        .collect()
+                };
+
+                (
+                    id.clone(),
+                    Node::Transform {
+                        in_ty: transform.inner.input().data_type(),
+                        outputs: output_specs,
                     },
                 )
             })
             .collect();
+
+        info!(
+            graph_transform_output_fast_path = fast_path_count.load(Ordering::Relaxed),
+            graph_transform_output_fallback = fallback_count.load(Ordering::Relaxed),
+            "Graph transform output discovery complete."
+        );
 
         // Sink nodes
         let sink_nodes: Vec<_> = sinks
@@ -330,8 +355,8 @@ impl Graph {
                 .expect("output didn't exist"),
             Node::Transform { outputs, .. } => outputs
                 .iter()
-                .find(|output| output.port == id.port)
-                .map(|output| output.ty)
+                .find(|(port, _)| port == &id.port)
+                .map(|(_, ty)| *ty)
                 .expect("output didn't exist"),
             Node::Sink { .. } => panic!("no outputs on sinks"),
         }
@@ -432,9 +457,9 @@ impl Graph {
                     .collect(),
                 Node::Transform { outputs, .. } => outputs
                     .iter()
-                    .map(|output| OutputId {
+                    .map(|(port, _)| OutputId {
                         component: key.clone(),
-                        port: output.port.clone(),
+                        port: port.clone(),
                     })
                     .collect(),
             })
@@ -557,10 +582,7 @@ mod test {
                 id.clone(),
                 Node::Transform {
                     in_ty,
-                    outputs: vec![TransformOutput::new(
-                        out_ty,
-                        [("test".into(), Definition::default_legacy_namespace())].into(),
-                    )],
+                    outputs: vec![(None, out_ty)],
                 },
             );
             for from in inputs {
@@ -574,13 +596,7 @@ mod test {
         fn add_transform_output(&mut self, id: &str, name: &str, ty: DataType) {
             let id = id.into();
             match self.nodes.get_mut(&id) {
-                Some(Node::Transform { outputs, .. }) => outputs.push(
-                    TransformOutput::new(
-                        ty,
-                        [("test".into(), Definition::default_legacy_namespace())].into(),
-                    )
-                    .with_port(name),
-                ),
+                Some(Node::Transform { outputs, .. }) => outputs.push((Some(name.to_owned()), ty)),
                 _ => panic!("invalid transform"),
             }
         }
@@ -831,15 +847,8 @@ mod test {
             Node::Transform {
                 in_ty: DataType::all_bits(),
                 outputs: vec![
-                    TransformOutput::new(
-                        DataType::all_bits(),
-                        [("test".into(), Definition::default_legacy_namespace())].into(),
-                    ),
-                    TransformOutput::new(
-                        DataType::all_bits(),
-                        [("test".into(), Definition::default_legacy_namespace())].into(),
-                    )
-                    .with_port("bar"),
+                    (None, DataType::all_bits()),
+                    (Some("bar".to_owned()), DataType::all_bits()),
                 ],
             },
         );
@@ -859,15 +868,8 @@ mod test {
             Node::Transform {
                 in_ty: DataType::all_bits(),
                 outputs: vec![
-                    TransformOutput::new(
-                        DataType::all_bits(),
-                        [("test".into(), Definition::default_legacy_namespace())].into(),
-                    ),
-                    TransformOutput::new(
-                        DataType::all_bits(),
-                        [("test".into(), Definition::default_legacy_namespace())].into(),
-                    )
-                    .with_port("errors"),
+                    (None, DataType::all_bits()),
+                    (Some("errors".to_owned()), DataType::all_bits()),
                 ],
             },
         );

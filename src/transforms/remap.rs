@@ -393,6 +393,14 @@ impl TransformConfig for RemapConfig {
         Some(ports)
     }
 
+    fn output_port_types(&self) -> Option<Vec<(Option<String>, DataType)>> {
+        let mut outputs = vec![(None, DataType::all_bits())];
+        if self.reroute_dropped {
+            outputs.push((Some(DROPPED.to_string()), DataType::all_bits()));
+        }
+        Some(outputs)
+    }
+
     fn enable_concurrency(&self) -> bool {
         true
     }

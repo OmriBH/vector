@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use dyn_clone::DynClone;
 use serde::Serialize;
 use vector_lib::{
-    config::{GlobalOptions, Input, LogNamespace, TransformOutput},
+    config::{DataType, GlobalOptions, Input, LogNamespace, TransformOutput},
     configurable::{
         Configurable, GenerateError, Metadata, NamedComponent,
         attributes::CustomAttribute,
@@ -227,6 +227,14 @@ pub trait TransformConfig: DynClone + NamedComponent + core::fmt::Debug + Send +
     ///
     /// Returning `None` falls back to deriving ports from `outputs(...)`.
     fn output_ports(&self) -> Option<Vec<Option<String>>> {
+        None
+    }
+
+    /// Gets lightweight output metadata (port names + data types) exposed by this transform.
+    ///
+    /// This is intended for call sites that only need output typing/wiring metadata and do not
+    /// require schema inference. Returning `None` falls back to deriving this from `outputs(...)`.
+    fn output_port_types(&self) -> Option<Vec<(Option<String>, DataType)>> {
         None
     }
 

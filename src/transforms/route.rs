@@ -182,6 +182,19 @@ impl TransformConfig for RouteConfig {
         Some(ports)
     }
 
+    fn output_port_types(&self) -> Option<Vec<(Option<String>, DataType)>> {
+        let mut outputs = self
+            .route
+            .keys()
+            .cloned()
+            .map(|port| (Some(port), DataType::all_bits()))
+            .collect::<Vec<_>>();
+        if self.reroute_unmatched {
+            outputs.push((Some(UNMATCHED_ROUTE.to_string()), DataType::all_bits()));
+        }
+        Some(outputs)
+    }
+
     fn enable_concurrency(&self) -> bool {
         true
     }

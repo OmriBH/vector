@@ -1,4 +1,10 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use snafu::Snafu;
 use vector_lib::config::SourceOutput;
@@ -18,7 +24,7 @@ pub(crate) type ConcurrentCache = std::sync::RwLock<Cache>;
 /// Without this, if transform U feeds into 50 downstream transforms,
 /// U.inner.outputs() would be called 50 times. With this cache, it's called once.
 pub(crate) type TransformOutputsCache =
-    std::sync::RwLock<HashMap<ComponentKey, Vec<TransformOutput>>>;
+    std::sync::RwLock<HashMap<ComponentKey, Arc<Vec<TransformOutput>>>>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -27,7 +33,29 @@ pub enum Error {
 
 /// The cache is used whilst building up the topology.
 /// TODO: Describe more, especially why we have a bool in the key.
-type Cache = HashMap<(bool, Vec<OutputId>), Vec<(OutputId, Definition)>>;
+type Cache = HashMap<(bool, Vec<OutputId>), Arc<Vec<(OutputId, Definition)>>>;
+
+static DEFINITIONS_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static DEFINITIONS_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static OUTPUTS_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static OUTPUTS_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CacheMetricsSnapshot {
+    pub definitions_hits: u64,
+    pub definitions_misses: u64,
+    pub outputs_hits: u64,
+    pub outputs_misses: u64,
+}
+
+pub(crate) fn cache_metrics_snapshot() -> CacheMetricsSnapshot {
+    CacheMetricsSnapshot {
+        definitions_hits: DEFINITIONS_CACHE_HITS.load(Ordering::Relaxed),
+        definitions_misses: DEFINITIONS_CACHE_MISSES.load(Ordering::Relaxed),
+        outputs_hits: OUTPUTS_CACHE_HITS.load(Ordering::Relaxed),
+        outputs_misses: OUTPUTS_CACHE_MISSES.load(Ordering::Relaxed),
+    }
+}
 
 pub fn possible_definitions(
     inputs: &[OutputId],
@@ -42,7 +70,7 @@ pub fn possible_definitions(
     // Try to get the definition from the cache.
     let cache_key = (config.schema_enabled(), inputs.to_vec());
     if let Some(definition) = cache.get(&cache_key) {
-        return Ok(definition.clone());
+        return Ok(definition.as_ref().clone());
     }
 
     let mut definitions = Vec::new();
@@ -104,7 +132,7 @@ pub fn possible_definitions(
     }
 
     // Cache the result to avoid redundant traversals
-    cache.insert(cache_key, definitions.clone());
+    cache.insert(cache_key, Arc::new(definitions.clone()));
 
     Ok(definitions)
 }
@@ -130,7 +158,7 @@ pub(super) fn expanded_definitions(
 ) -> Result<Vec<(OutputId, Definition)>, Error> {
     // Try to get the definition from the cache.
     if let Some(definitions) = cache.get(&(config.schema_enabled(), inputs.to_vec())) {
-        return Ok(definitions.clone());
+        return Ok(definitions.as_ref().clone());
     }
 
     let mut definitions: Vec<(OutputId, Definition)> = vec![];
@@ -212,7 +240,7 @@ pub(super) fn expanded_definitions(
 
     cache.insert(
         (config.schema_enabled(), inputs.to_vec()),
-        definitions.clone(),
+        Arc::new(definitions.clone()),
     );
 
     Ok(definitions)
@@ -234,7 +262,7 @@ pub(crate) fn input_definitions(
 
     let cache_key = (config.schema_enabled(), inputs.to_vec());
     if let Some(definitions) = cache.get(&cache_key) {
-        return Ok(definitions.clone());
+        return Ok(definitions.as_ref().clone());
     }
 
     let mut definitions = Vec::new();
@@ -302,7 +330,7 @@ pub(crate) fn input_definitions(
     }
 
     // Cache the result to avoid redundant recursive traversals
-    cache.insert(cache_key, definitions.clone());
+    cache.insert(cache_key, Arc::new(definitions.clone()));
 
     Ok(definitions)
 }
@@ -323,9 +351,9 @@ pub(crate) fn input_definitions_concurrent(
     enrichment_tables: vector_lib::enrichment::TableRegistry,
     cache: &ConcurrentCache,
     outputs_cache: &TransformOutputsCache,
-) -> Result<Vec<(OutputId, Definition)>, Error> {
+) -> Result<Arc<Vec<(OutputId, Definition)>>, Error> {
     if inputs.is_empty() {
-        return Ok(vec![]);
+        return Ok(Arc::new(vec![]));
     }
 
     let cache_key = (config.schema_enabled(), inputs.to_vec());
@@ -334,9 +362,11 @@ pub(crate) fn input_definitions_concurrent(
     {
         let cache_guard = cache.read().unwrap();
         if let Some(definitions) = cache_guard.get(&cache_key) {
+            DEFINITIONS_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(definitions.clone());
         }
     }
+    DEFINITIONS_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
     let mut definitions = Vec::new();
 
@@ -379,12 +409,16 @@ pub(crate) fn input_definitions_concurrent(
             };
 
             let all_outputs = if let Some(outputs) = cached_outputs {
+                OUTPUTS_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                 outputs
             } else {
+                OUTPUTS_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
                 // Compute and cache
-                let outputs = config
+                let outputs = Arc::new(
+                    config
                     .transform_outputs(key, enrichment_tables.clone(), &transform_definitions)
-                    .expect("transform must exist - already found inputs");
+                    .expect("transform must exist - already found inputs"),
+                );
                 let mut guard = outputs_cache.write().unwrap();
                 guard.insert(key.clone(), outputs.clone());
                 outputs
@@ -392,8 +426,8 @@ pub(crate) fn input_definitions_concurrent(
 
             // Find the output matching the requested port
             let matching_output = all_outputs
-                .into_iter()
-                .find(|output| &output.port == &input.port)
+                .iter()
+                .find(|output| output.port == input.port)
                 .unwrap_or_else(|| {
                     unreachable!(
                         "transform output mis-configured - output for port {:?} missing",
@@ -419,9 +453,114 @@ pub(crate) fn input_definitions_concurrent(
     // Brief write lock to insert into cache
     {
         let mut cache_guard = cache.write().unwrap();
+        let definitions = Arc::new(definitions);
         cache_guard.insert(cache_key, definitions.clone());
+        return Ok(definitions);
+    }
+}
+
+/// Layer-aware input definition computation used by topology builder.
+///
+/// This fast path assumes upstream transform outputs for dependencies in earlier layers
+/// are already present in `outputs_cache`. It avoids recursive graph walks for the
+/// common acyclic case. If a dependency is unexpectedly missing from `outputs_cache`,
+/// it falls back to `input_definitions_concurrent` for correctness.
+pub(crate) fn input_definitions_layered(
+    inputs: &[OutputId],
+    config: &Config,
+    enrichment_tables: vector_lib::enrichment::TableRegistry,
+    cache: &ConcurrentCache,
+    outputs_cache: &TransformOutputsCache,
+) -> Result<Arc<Vec<(OutputId, Definition)>>, Error> {
+    if inputs.is_empty() {
+        return Ok(Arc::new(vec![]));
     }
 
+    let cache_key = (config.schema_enabled(), inputs.to_vec());
+    {
+        let cache_guard = cache.read().unwrap();
+        if let Some(definitions) = cache_guard.get(&cache_key) {
+            DEFINITIONS_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(definitions.clone());
+        }
+    }
+    DEFINITIONS_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+
+    let mut definitions = Vec::new();
+
+    for input in inputs {
+        let key = &input.component;
+
+        if let Ok(maybe_output) = config.source_output_for_port(key, &input.port) {
+            let mut source_definitions = input.with_definitions(
+                maybe_output
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "source output mis-configured - output for port {:?} missing",
+                            &input.port
+                        )
+                    })
+                    .schema_definition(config.schema_enabled()),
+            );
+
+            if contains_never(&source_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut source_definitions);
+        }
+
+        if config.transform_inputs(key).is_some() {
+            let cached_outputs = {
+                let guard = outputs_cache.read().unwrap();
+                guard.get(key).cloned()
+            };
+
+            let all_outputs = if let Some(outputs) = cached_outputs {
+                OUTPUTS_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                outputs
+            } else {
+                OUTPUTS_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+                // Safety fallback for unexpected ordering/cycle edge cases.
+                return input_definitions_concurrent(
+                    inputs,
+                    config,
+                    enrichment_tables,
+                    cache,
+                    outputs_cache,
+                );
+            };
+
+            let matching_output = all_outputs
+                .iter()
+                .find(|output| output.port == input.port)
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "transform output mis-configured - output for port {:?} missing",
+                        &input.port
+                    )
+                });
+
+            let mut transform_definitions = input.with_definitions(
+                matching_output
+                    .schema_definitions(config.schema_enabled())
+                    .values()
+                    .cloned(),
+            );
+
+            if contains_never(&transform_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut transform_definitions);
+        }
+    }
+
+    let definitions = Arc::new(definitions);
+    {
+        let mut cache_guard = cache.write().unwrap();
+        cache_guard.insert(cache_key, definitions.clone());
+    }
     Ok(definitions)
 }
 
@@ -430,7 +569,7 @@ pub(crate) fn input_definitions_concurrent(
 pub(crate) fn get_cached_transform_outputs(
     outputs_cache: &TransformOutputsCache,
     key: &ComponentKey,
-) -> Option<Vec<TransformOutput>> {
+) -> Option<Arc<Vec<TransformOutput>>> {
     let guard = outputs_cache.read().unwrap();
     guard.get(key).cloned()
 }

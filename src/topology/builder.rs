@@ -538,23 +538,32 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let num_layers = current_layer;
+        let num_layers = if transforms_to_process.is_empty() {
+            0
+        } else {
+            transform_layer.values().copied().max().unwrap_or(0) + 1
+        };
+
+        let mut layer_buckets: Vec<Vec<(&crate::config::ComponentKey, &TransformOuter<OutputId>)>> =
+            (0..num_layers).map(|_| Vec::new()).collect();
+        for &(key, transform) in &transforms_to_process {
+            let layer = *transform_layer
+                .get(key)
+                .expect("all transforms should have an assigned layer");
+            layer_buckets[layer].push((key, transform));
+        }
 
         // Build a lookup map from pre-computed results
         let mut definitions_map: HashMap<
             crate::config::ComponentKey,
-            Vec<(crate::config::OutputId, Definition)>,
+            Arc<Vec<(crate::config::OutputId, Definition)>>,
         > = HashMap::with_capacity(transforms_to_process.len());
 
         // Process layer by layer — within each layer, all transforms run in parallel.
         // After each layer, pre-compute outputs for that layer's transforms so
         // the NEXT layer finds them in cache (eliminating thundering herd / cache stampede).
         let mut schema_error = false;
-        for layer in 0..num_layers {
-            let layer_transforms: Vec<_> = transforms_to_process
-                .iter()
-                .filter(|(key, _)| transform_layer.get(key) == Some(&layer))
-                .collect();
+        for (layer, layer_transforms) in layer_buckets.iter().enumerate() {
 
             debug!(
                 layer = layer,
@@ -567,8 +576,8 @@ impl<'a> Builder<'a> {
             // For layer N>0, all upstream outputs are pre-cached from previous layers.
             let layer_results: Vec<_> = layer_transforms
                 .par_iter()
-                .map(|&&(key, transform)| {
-                    let result = schema::input_definitions_concurrent(
+                .map(|&(key, transform)| {
+                    let result = schema::input_definitions_layered(
                         &transform.inputs,
                         config,
                         enrichment_tables_for_par.clone(),
@@ -600,7 +609,7 @@ impl<'a> Builder<'a> {
             // the same outputs simultaneously.
             let layer_keys: Vec<_> = layer_transforms
                 .iter()
-                .map(|&&(key, _)| key)
+                .map(|&(key, _)| key)
                 .collect();
 
             layer_keys.par_iter().for_each(|key| {
@@ -613,18 +622,28 @@ impl<'a> Builder<'a> {
                 }
                 if let Some(input_defs) = definitions_map.get(key) {
                     if let Some(outputs) =
-                        config.transform_outputs(key, enrichment_tables_for_par.clone(), input_defs)
+                        config.transform_outputs(
+                            key,
+                            enrichment_tables_for_par.clone(),
+                            input_defs.as_slice(),
+                        )
                     {
                         let mut guard = outputs_cache.write().unwrap();
-                        guard.insert((*key).clone(), outputs);
+                        guard.insert((*key).clone(), Arc::new(outputs));
                     }
                 }
             });
         }
 
+        let cache_metrics = schema::cache_metrics_snapshot();
+
         info!(
             elapsed_ms = schema_start.elapsed().as_millis() as u64,
             layers = num_layers,
+            definitions_cache_hits = cache_metrics.definitions_hits,
+            definitions_cache_misses = cache_metrics.definitions_misses,
+            outputs_cache_hits = cache_metrics.outputs_hits,
+            outputs_cache_misses = cache_metrics.outputs_misses,
             "Schema definition resolution complete."
         );
 
@@ -643,7 +662,7 @@ impl<'a> Builder<'a> {
                 let input_definitions = definitions_map
                     .get(key)
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| Arc::new(Vec::new()));
 
                 let merged_definition: Definition = input_definitions
                     .iter()
@@ -664,23 +683,24 @@ impl<'a> Builder<'a> {
                 let transform_outputs = schema::get_cached_transform_outputs(
                     &outputs_cache,
                     key,
-                ).unwrap_or_else(|| {
-                    transform.inner.outputs(
+                )
+                .unwrap_or_else(|| {
+                    Arc::new(transform.inner.outputs(
                         &TransformContext {
                             enrichment_tables: enrichment_tables.clone(),
                             metrics_storage: METRICS_STORAGE.clone(),
                             schema: config_schema,
                             ..Default::default()
                         },
-                        &input_definitions,
-                    )
+                        input_definitions.as_slice(),
+                    ))
                 });
 
                 let schema_definitions = transform_outputs
-                    .into_iter()
+                    .iter()
                     .map(|output| {
                         let definitions = output.schema_definitions(config_schema.enabled);
-                        (output.port, definitions)
+                        (output.port.clone(), definitions)
                     })
                     .collect::<HashMap<_, _>>();
 
@@ -696,7 +716,12 @@ impl<'a> Builder<'a> {
                 };
 
                 let node =
-                    TransformNode::from_parts(key.clone(), &context, transform, &input_definitions);
+                    TransformNode::from_parts(
+                        key.clone(),
+                        &context,
+                        transform,
+                        input_definitions.as_slice(),
+                    );
 
                 // Clone the inner transform config so we can move it into a spawned task.
                 let inner_clone = transform.inner.clone();
