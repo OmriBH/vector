@@ -51,11 +51,19 @@ impl Function for FindEnrichmentTableRecords {
         "find_enrichment_table_records"
     }
 
+    fn category(&self) -> &'static str {
+        "enrichment"
+    }
+
     fn usage(&self) -> &'static str {
         const_str::concat!(
             "Searches an [enrichment table](/docs/reference/glossary/#enrichment-tables) for rows that match the provided condition.\n\n",
             super::ENRICHMENT_TABLE_EXPLAINER
         )
+    }
+
+    fn return_kind(&self) -> u16 {
+        kind::ARRAY
     }
 
     fn parameters(&self) -> &'static [Parameter] {
@@ -64,26 +72,41 @@ impl Function for FindEnrichmentTableRecords {
                 keyword: "table",
                 kind: kind::BYTES,
                 required: true,
+                description: "The enrichment table to query.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "condition",
                 kind: kind::OBJECT,
                 required: true,
+                description: "Object of field/value match conditions.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "select",
                 kind: kind::ARRAY,
                 required: false,
+                description: "Optional list of columns to include.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "case_sensitive",
                 kind: kind::BOOLEAN,
                 required: false,
+                description: "Whether matching is case-sensitive.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "wildcard",
                 kind: kind::BYTES,
                 required: false,
+                description: "Optional wildcard match value.",
+                default: None,
+                enum_variants: None,
             },
         ]
     }

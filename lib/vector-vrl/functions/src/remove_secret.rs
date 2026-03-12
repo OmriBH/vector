@@ -14,8 +14,16 @@ impl Function for RemoveSecret {
         "remove_secret"
     }
 
+    fn category(&self) -> &'static str {
+        "secrets"
+    }
+
     fn usage(&self) -> &'static str {
         "Removes a secret from an event."
+    }
+
+    fn return_kind(&self) -> u16 {
+        kind::NULL
     }
 
     fn parameters(&self) -> &'static [Parameter] {
@@ -23,6 +31,9 @@ impl Function for RemoveSecret {
             keyword: "key",
             kind: kind::BYTES,
             required: true,
+            description: "The secret key to remove.",
+            default: None,
+            enum_variants: None,
         }]
     }
 

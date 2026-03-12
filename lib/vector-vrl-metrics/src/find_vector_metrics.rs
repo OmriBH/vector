@@ -30,11 +30,19 @@ impl Function for FindVectorMetrics {
         "find_vector_metrics"
     }
 
+    fn category(&self) -> &'static str {
+        "metrics"
+    }
+
     fn usage(&self) -> &'static str {
         const_str::concat!(
             "Searches internal Vector metrics by name and optionally by tags. Returns all matching metrics.\n\n",
             crate::VECTOR_METRICS_EXPLAINER
         )
+    }
+
+    fn return_kind(&self) -> u16 {
+        kind::OBJECT
     }
 
     fn parameters(&self) -> &'static [Parameter] {
@@ -43,11 +51,17 @@ impl Function for FindVectorMetrics {
                 keyword: "key",
                 kind: kind::BYTES,
                 required: true,
+                description: "Metric name to match.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "tags",
                 kind: kind::OBJECT,
                 required: false,
+                description: "Optional tag filters.",
+                default: None,
+                enum_variants: None,
             },
         ]
     }

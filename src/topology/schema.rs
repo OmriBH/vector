@@ -63,6 +63,17 @@ pub fn possible_definitions(
     enrichment_tables: vector_lib::enrichment::TableRegistry,
     cache: &mut Cache,
 ) -> Result<Vec<(OutputId, Definition)>, Error> {
+    let outputs_cache = TransformOutputsCache::new(HashMap::default());
+    possible_definitions_with_cache(inputs, config, enrichment_tables, cache, &outputs_cache)
+}
+
+fn possible_definitions_with_cache(
+    inputs: &[OutputId],
+    config: &dyn ComponentContainer,
+    enrichment_tables: vector_lib::enrichment::TableRegistry,
+    cache: &mut Cache,
+    outputs_cache: &TransformOutputsCache,
+) -> Result<Vec<(OutputId, Definition)>, Error> {
     if inputs.is_empty() {
         return Ok(vec![]);
     }
@@ -101,23 +112,44 @@ pub fn possible_definitions(
         // If the input is a transform, the output is merged into the top-level schema
         if let Some(inputs) = config.transform_inputs(key) {
             let input_definitions =
-                possible_definitions(inputs, config, enrichment_tables.clone(), cache)?;
+                possible_definitions_with_cache(
+                    inputs,
+                    config,
+                    enrichment_tables.clone(),
+                    cache,
+                    outputs_cache,
+                )?;
+
+            let cached_outputs = {
+                let guard = outputs_cache.read().unwrap();
+                guard.get(key).cloned()
+            };
+
+            let all_outputs = if let Some(outputs) = cached_outputs {
+                outputs
+            } else {
+                let outputs = Arc::new(
+                    config
+                        .transform_outputs(key, enrichment_tables.clone(), &input_definitions)
+                        .expect("transform must exist - already found inputs"),
+                );
+                let mut guard = outputs_cache.write().unwrap();
+                guard.insert(key.clone(), outputs.clone());
+                outputs
+            };
+
+            let matching_output = all_outputs
+                .iter()
+                .find(|output| output.port == input.port)
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "transform output mis-configured - output for port {:?} missing",
+                        &input.port
+                    )
+                });
 
             let mut transform_definition = input.with_definitions(
-                config
-                    .transform_output_for_port(
-                        key,
-                        &input.port,
-                        enrichment_tables.clone(),
-                        &input_definitions,
-                    )
-                    .expect("transform must exist - already found inputs")
-                    .unwrap_or_else(|| {
-                        unreachable!(
-                            "transform output mis-configured - output for port {:?} missing",
-                            &input.port
-                        )
-                    })
+                matching_output
                     .schema_definitions(config.schema_enabled())
                     .values()
                     .cloned(),
@@ -150,11 +182,23 @@ pub fn possible_definitions(
 /// definitions, one for each route leading into `Sink 1`, with the route going through `Transform
 /// 5` being expanded into two individual routes (So1 -> T3 -> T5 -> Si1 AND So1 -> T4 -> T5 ->
 /// Si1).
+#[allow(dead_code)]
 pub(super) fn expanded_definitions(
     enrichment_tables: vector_lib::enrichment::TableRegistry,
     inputs: &[OutputId],
     config: &dyn ComponentContainer,
     cache: &mut Cache,
+) -> Result<Vec<(OutputId, Definition)>, Error> {
+    let outputs_cache = TransformOutputsCache::new(HashMap::default());
+    expanded_definitions_with_cache(inputs, config, enrichment_tables, cache, &outputs_cache)
+}
+
+fn expanded_definitions_with_cache(
+    inputs: &[OutputId],
+    config: &dyn ComponentContainer,
+    enrichment_tables: vector_lib::enrichment::TableRegistry,
+    cache: &mut Cache,
+    outputs_cache: &TransformOutputsCache,
 ) -> Result<Vec<(OutputId, Definition)>, Error> {
     // Try to get the definition from the cache.
     if let Some(definitions) = cache.get(&(config.schema_enabled(), inputs.to_vec())) {
@@ -203,12 +247,33 @@ pub(super) fn expanded_definitions(
         // A transform can receive from multiple inputs, and each input needs to be expanded to
         // a new pipeline.
         } else if let Some(inputs) = config.transform_inputs(key) {
-            let input_definitions =
-                possible_definitions(inputs, config, enrichment_tables.clone(), &mut merged_cache)?;
+            let input_definitions = possible_definitions_with_cache(
+                inputs,
+                config,
+                enrichment_tables.clone(),
+                &mut merged_cache,
+                outputs_cache,
+            )?;
 
-            let mut transform_definition = config
-                .transform_outputs(key, enrichment_tables.clone(), &input_definitions)
-                .expect("already found inputs")
+            let cached_outputs = {
+                let guard = outputs_cache.read().unwrap();
+                guard.get(key).cloned()
+            };
+
+            let all_outputs = if let Some(outputs) = cached_outputs {
+                outputs
+            } else {
+                let outputs = Arc::new(
+                    config
+                        .transform_outputs(key, enrichment_tables.clone(), &input_definitions)
+                        .expect("already found inputs"),
+                );
+                let mut guard = outputs_cache.write().unwrap();
+                guard.insert(key.clone(), outputs.clone());
+                outputs
+            };
+
+            let mut transform_definition = all_outputs
                 .iter()
                 .find_map(|output| {
                     if output.port == input.port {
@@ -588,6 +653,7 @@ pub(super) fn validate_sink_expectations(
     sink: &SinkOuter<OutputId>,
     config: &topology::Config,
     enrichment_tables: vector_lib::enrichment::TableRegistry,
+    outputs_cache: &TransformOutputsCache,
 ) -> Result<(), Vec<String>> {
     let mut errors = vec![];
 
@@ -599,14 +665,19 @@ pub(super) fn validate_sink_expectations(
     }
 
     let mut cache = HashMap::default();
-    let definitions =
-        match expanded_definitions(enrichment_tables, &sink.inputs, config, &mut cache) {
-            Ok(definitions) => definitions,
-            Err(err) => {
-                errors.push(err.to_string());
-                return Err(errors);
-            }
-        };
+    let definitions = match expanded_definitions_with_cache(
+        &sink.inputs,
+        config,
+        enrichment_tables,
+        &mut cache,
+        outputs_cache,
+    ) {
+        Ok(definitions) => definitions,
+        Err(err) => {
+            errors.push(err.to_string());
+            return Err(errors);
+        }
+    };
 
     // Validate each individual definition against the sink requirement.
     for (_output, definition) in definitions {

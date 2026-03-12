@@ -144,8 +144,8 @@ impl<'a> Builder<'a> {
     async fn build(mut self) -> Result<TopologyPieces, Vec<String>> {
         let enrichment_tables = self.load_enrichment_tables().await;
         let source_tasks = self.build_sources(enrichment_tables).await;
-        self.build_transforms(enrichment_tables).await;
-        self.build_sinks(enrichment_tables).await;
+        let outputs_cache = self.build_transforms(enrichment_tables).await;
+        self.build_sinks(enrichment_tables, &outputs_cache).await;
 
         // We should have all the data for the enrichment tables loaded now, so switch them over to
         // readonly.
@@ -455,7 +455,7 @@ impl<'a> Builder<'a> {
     async fn build_transforms(
         &mut self,
         enrichment_tables: &vector_lib::enrichment::TableRegistry,
-    ) {
+    ) -> schema::TransformOutputsCache {
         use rayon::prelude::*;
 
         let build_transforms_start = Instant::now();
@@ -600,7 +600,7 @@ impl<'a> Builder<'a> {
             }
 
             if schema_error {
-                return;
+                return outputs_cache;
             }
 
             // Step 2: Compute full outputs for this layer's transforms with real
@@ -792,9 +792,15 @@ impl<'a> Builder<'a> {
             total_elapsed_ms = build_transforms_start.elapsed().as_millis() as u64,
             "Transform build pipeline finished."
         );
+
+        outputs_cache
     }
 
-    async fn build_sinks(&mut self, enrichment_tables: &vector_lib::enrichment::TableRegistry) {
+    async fn build_sinks(
+        &mut self,
+        enrichment_tables: &vector_lib::enrichment::TableRegistry,
+        outputs_cache: &schema::TransformOutputsCache,
+    ) {
         let table_sinks = self
             .config
             .enrichment_tables
@@ -838,6 +844,7 @@ impl<'a> Builder<'a> {
                 sink,
                 self.config,
                 enrichment_tables.clone(),
+                outputs_cache,
             ) {
                 self.errors.append(&mut err);
             };

@@ -17,8 +17,16 @@ impl Function for GetSecret {
         "get_secret"
     }
 
+    fn category(&self) -> &'static str {
+        "secrets"
+    }
+
     fn usage(&self) -> &'static str {
         "Returns the value of the given secret from an event."
+    }
+
+    fn return_kind(&self) -> u16 {
+        kind::BYTES | kind::NULL
     }
 
     fn parameters(&self) -> &'static [Parameter] {
@@ -26,6 +34,9 @@ impl Function for GetSecret {
             keyword: "key",
             kind: kind::BYTES,
             required: true,
+            description: "The secret key to read.",
+            default: None,
+            enum_variants: None,
         }]
     }
 

@@ -47,11 +47,19 @@ impl Function for AggregateVectorMetrics {
         "aggregate_vector_metrics"
     }
 
+    fn category(&self) -> &'static str {
+        "metrics"
+    }
+
     fn usage(&self) -> &'static str {
         const_str::concat!(
             "Aggregates internal Vector metrics, using one of 4 aggregation functions, filtering by name and optionally by tags. Returns the aggregated value. Only includes counter and gauge metrics.\n\n",
             crate::VECTOR_METRICS_EXPLAINER
         )
+    }
+
+    fn return_kind(&self) -> u16 {
+        kind::FLOAT | kind::NULL
     }
 
     fn parameters(&self) -> &'static [Parameter] {
@@ -60,16 +68,25 @@ impl Function for AggregateVectorMetrics {
                 keyword: "function",
                 kind: kind::BYTES,
                 required: true,
+                description: "Aggregation function: sum, avg, min, or max.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "key",
                 kind: kind::BYTES,
                 required: true,
+                description: "Metric name to match.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "tags",
                 kind: kind::OBJECT,
                 required: false,
+                description: "Optional tag filters.",
+                default: None,
+                enum_variants: None,
             },
         ]
     }

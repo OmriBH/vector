@@ -21,8 +21,16 @@ impl Function for SetSecret {
         "set_secret"
     }
 
+    fn category(&self) -> &'static str {
+        "secrets"
+    }
+
     fn usage(&self) -> &'static str {
         "Sets the given secret in the event."
+    }
+
+    fn return_kind(&self) -> u16 {
+        kind::NULL
     }
 
     fn parameters(&self) -> &'static [Parameter] {
@@ -31,11 +39,17 @@ impl Function for SetSecret {
                 keyword: "key",
                 kind: kind::BYTES,
                 required: true,
+                description: "The secret key to set.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "secret",
                 kind: kind::BYTES,
                 required: true,
+                description: "The secret value to store.",
+                default: None,
+                enum_variants: None,
             },
         ]
     }

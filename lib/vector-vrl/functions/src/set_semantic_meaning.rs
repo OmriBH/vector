@@ -36,6 +36,10 @@ impl Function for SetSemanticMeaning {
         "set_semantic_meaning"
     }
 
+    fn category(&self) -> &'static str {
+        "schema"
+    }
+
     fn usage(&self) -> &'static str {
         indoc! {"
             Sets a semantic meaning for an event. **Note**: This function assigns
@@ -46,17 +50,27 @@ impl Function for SetSemanticMeaning {
         "}
     }
 
+    fn return_kind(&self) -> u16 {
+        kind::NULL
+    }
+
     fn parameters(&self) -> &'static [Parameter] {
         &[
             Parameter {
                 keyword: "target",
                 kind: kind::ANY,
                 required: true,
+                description: "The event or metadata field path to annotate.",
+                default: None,
+                enum_variants: None,
             },
             Parameter {
                 keyword: "meaning",
                 kind: kind::BYTES,
                 required: true,
+                description: "Semantic meaning name to assign to the field.",
+                default: None,
+                enum_variants: None,
             },
         ]
     }

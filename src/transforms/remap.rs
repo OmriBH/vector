@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{LazyLock, Mutex},
     time::Instant,
 };
 
@@ -49,8 +49,18 @@ use crate::{
 };
 
 const DROPPED: &str = "dropped";
-type CacheKey = (TableRegistry, schema::Definition);
+
+/// Cache key: (vrl_source, enrichment_tables, merged_schema_definition).
+/// Including the source string allows the cache to be shared across all RemapConfig instances,
+/// so two transforms with identical VRL code and identical input schema compile only once.
+type CacheKey = (String, TableRegistry, schema::Definition);
 type CacheValue = (Program, String, MeaningList);
+
+/// Process-level VRL compilation cache shared across ALL remap transform instances.
+/// This eliminates redundant compilations when multiple transforms share the same
+/// VRL source code and input schema definition.
+static GLOBAL_VRL_CACHE: LazyLock<Mutex<Vec<(CacheKey, std::result::Result<CacheValue, String>)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Configuration for the `remap` transform.
 #[configurable_component(transform(
@@ -158,13 +168,6 @@ pub struct RemapConfig {
     #[serde(default)]
     pub runtime: VrlRuntime,
 
-    #[configurable(derived, metadata(docs::hidden))]
-    #[serde(skip)]
-    #[derivative(Debug = "ignore")]
-    /// Cache can't be `BTreeMap` or `HashMap` because of `TableRegistry`, which doesn't allow us to inspect tables inside it.
-    /// And even if we allowed the inspection, the tables can be huge, resulting in a long comparison or hash computation
-    /// while using `Vec` allows us to use just a shallow comparison
-    pub cache: Arc<Mutex<Vec<(CacheKey, std::result::Result<CacheValue, String>)>>>,
 }
 
 impl Clone for RemapConfig {
@@ -179,7 +182,6 @@ impl Clone for RemapConfig {
             drop_on_abort: self.drop_on_abort,
             reroute_dropped: self.reroute_dropped,
             runtime: self.runtime,
-            cache: self.cache.clone(),
         }
     }
 }
@@ -191,16 +193,8 @@ impl RemapConfig {
         metrics_storage: MetricsStorage,
         merged_schema_definition: schema::Definition,
     ) -> Result<(Program, String, MeaningList)> {
-        if let Some((_, res)) = self
-            .cache
-            .lock()
-            .expect("Data poisoned")
-            .iter()
-            .find(|v| v.0.0 == enrichment_tables && v.0.1 == merged_schema_definition)
-        {
-            return res.clone().map_err(Into::into);
-        }
-
+        // Resolve the VRL source text first so it can be part of the global cache key.
+        // This lets any two transforms with identical source + schema share one compilation.
         let source = match (&self.source, &self.file, &self.files) {
             (Some(source), None, None) => source.to_owned(),
             (None, Some(path), None) => Self::read_file(path)?,
@@ -215,6 +209,22 @@ impl RemapConfig {
             }
             _ => return Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
         };
+
+        // Check the process-level global cache before compiling.
+        {
+            let cache = GLOBAL_VRL_CACHE.lock().expect("Global VRL cache poisoned");
+            if let Some((_, res)) = cache.iter().find(|v| {
+                v.0.0 == source
+                    && v.0.1 == enrichment_tables
+                    && v.0.2 == merged_schema_definition
+            }) {
+                debug!(
+                    source_bytes = source.len(),
+                    "VRL program cache hit (global).",
+                );
+                return res.clone().map_err(Into::into);
+            }
+        }
 
         let state = TypeState {
             local: Default::default(),
@@ -246,10 +256,10 @@ impl RemapConfig {
             "VRL program compiled.",
         );
 
-        self.cache
+        GLOBAL_VRL_CACHE
             .lock()
-            .expect("Data poisoned")
-            .push(((enrichment_tables, merged_schema_definition), res.clone()));
+            .expect("Global VRL cache poisoned")
+            .push(((source, enrichment_tables, merged_schema_definition), res.clone()));
 
         res.map_err(Into::into)
     }
