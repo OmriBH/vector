@@ -38,6 +38,9 @@ RUN --mount=type=cache,id=vector-rustup,target=/usr/local/rustup,sharing=locked 
     && cargo --version
 
 # Build with specific features only (thin build)
+ARG BUILD_JOBS=0
+ENV CARGO_BUILD_JOBS=${BUILD_JOBS}
+
 ENV CARGO_FEATURES="api,enrichment-tables,transforms,secrets,unix,\
 sources-file,sources-http_server,sources-http_client,sources-kafka,\
 sources-internal_logs,sources-internal_metrics,sources-vector,\
@@ -82,6 +85,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy the binary from builder
 COPY --from=builder /vector/vector-bin /usr/bin/vector
+
+# jemalloc tuning: reduce arena fragmentation during VRL compilation startup
+# narenas:4 reduces from 2*CPU (128 on 64-core) to 4, improving memory reuse
+# dirty/muzzy_decay_ms:1000 returns freed pages 10x faster than default 10s
+ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4"
 
 # Smoke test
 RUN ["/usr/bin/vector", "--version"]

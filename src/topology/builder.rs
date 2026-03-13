@@ -458,6 +458,11 @@ impl<'a> Builder<'a> {
     ) -> schema::TransformOutputsCache {
         use rayon::prelude::*;
 
+        let pool = rayon::ThreadPoolBuilder::new()
+            .stack_size(16 * 1024 * 1024)
+            .build()
+            .expect("Failed to build rayon thread pool");
+
         let build_transforms_start = Instant::now();
 
         // Collect all transforms that need processing
@@ -562,6 +567,7 @@ impl<'a> Builder<'a> {
         // Process layer by layer — within each layer, all transforms run in parallel.
         // After each layer, pre-compute outputs for that layer's transforms so
         // the NEXT layer finds them in cache (eliminating thundering herd / cache stampede).
+        // Uses a custom thread pool with 64 MB stack to handle deep TypeState recursion.
         let mut schema_error = false;
         for (layer, layer_transforms) in layer_buckets.iter().enumerate() {
 
@@ -574,19 +580,21 @@ impl<'a> Builder<'a> {
             // Step 1: Resolve input definitions for all transforms in this layer.
             // For layer 0, inputs are sources (no outputs() needed).
             // For layer N>0, all upstream outputs are pre-cached from previous layers.
-            let layer_results: Vec<_> = layer_transforms
-                .par_iter()
-                .map(|&(key, transform)| {
-                    let result = schema::input_definitions_layered(
-                        &transform.inputs,
-                        config,
-                        enrichment_tables_for_par.clone(),
-                        &concurrent_cache,
-                        &outputs_cache,
-                    );
-                    (key.clone(), result)
-                })
-                .collect();
+            let layer_results: Vec<_> = pool.install(|| {
+                layer_transforms
+                    .par_iter()
+                    .map(|&(key, transform)| {
+                        let result = schema::input_definitions_layered(
+                            &transform.inputs,
+                            config,
+                            enrichment_tables_for_par.clone(),
+                            &concurrent_cache,
+                            &outputs_cache,
+                        );
+                        (key.clone(), result)
+                    })
+                    .collect()
+            });
 
             for (key, result) in layer_results {
                 match result {
@@ -603,29 +611,36 @@ impl<'a> Builder<'a> {
                 return outputs_cache;
             }
 
-            // Step 2: Compute full outputs for this layer's transforms with real
-            // definitions.  VRL compiles here with accurate (narrow) input types,
-            // which is ~37% faster than compiling with Definition::any().  The
-            // remap cache is populated so build() and sink validation get hits.
-            layer_transforms.par_iter().for_each(|&(key, _transform)| {
-                {
-                    let guard = outputs_cache.read().unwrap();
-                    if guard.contains_key(key) {
-                        return;
+            // Step 2: Pre-compute outputs for this layer's transforms in parallel.
+            // This ensures the next layer gets instant cache hits when it references
+            // these transforms as inputs, instead of N threads racing to compute
+            // the same outputs simultaneously.
+            let layer_keys: Vec<_> = layer_transforms
+                .iter()
+                .map(|&(key, _)| key)
+                .collect();
+
+            pool.install(|| {
+                layer_keys.par_iter().for_each(|key| {
+                    {
+                        let guard = outputs_cache.read().unwrap();
+                        if guard.contains_key(key) {
+                            return;
+                        }
                     }
-                }
-                if let Some(input_defs) = definitions_map.get(key) {
-                    let outputs = match config.transform_outputs(
-                        key,
-                        enrichment_tables_for_par.clone(),
-                        input_defs.as_slice(),
-                    ) {
-                        Some(o) => o,
-                        None => return,
-                    };
-                    let mut guard = outputs_cache.write().unwrap();
-                    guard.insert((*key).clone(), Arc::new(outputs));
-                }
+                    if let Some(input_defs) = definitions_map.get(key) {
+                        if let Some(outputs) =
+                            config.transform_outputs(
+                                key,
+                                enrichment_tables_for_par.clone(),
+                                input_defs.as_slice(),
+                            )
+                        {
+                            let mut guard = outputs_cache.write().unwrap();
+                            guard.insert((*key).clone(), Arc::new(outputs));
+                        }
+                    }
+                });
             });
         }
 
@@ -648,80 +663,78 @@ impl<'a> Builder<'a> {
         let config_global = &self.config.global;
         let extra_context = &self.extra_context;
 
-        let prepared_transforms: Vec<_> = transforms_to_process
-            .par_iter()
-            .map(|&(key, transform)| {
-                debug!(component_id = %key, "Preparing transform.");
+        let prepared_transforms: Vec<_> = pool.install(|| {
+            transforms_to_process
+                .par_iter()
+                .map(|&(key, transform)| {
+                    debug!(component_id = %key, "Preparing transform.");
 
-                let input_definitions = definitions_map
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(Vec::new()));
+                    let input_definitions = definitions_map
+                        .get(key)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Vec::new()));
 
-                let merged_definition: Definition = input_definitions
-                    .iter()
-                    .map(|(_output_id, definition)| definition.clone())
-                    .reduce(Definition::merge)
-                    .unwrap_or_else(Definition::any);
+                    let merged_definition: Definition = input_definitions
+                        .iter()
+                        .map(|(_output_id, definition)| definition.clone())
+                        .reduce(Definition::merge)
+                        .unwrap_or_else(Definition::any);
 
-                let span = error_span!(
-                    "transform",
-                    component_kind = "transform",
-                    component_id = %key.id(),
-                    component_type = %transform.inner.get_component_name(),
-                );
-
-                // Use cached lightweight outputs from schema resolution.
-                // This avoids triggering VRL compilation here — VRL only
-                // compiles once in build() where it's actually needed.
-                let transform_outputs = schema::get_cached_transform_outputs(
-                    &outputs_cache,
-                    key,
-                )
-                .unwrap_or_else(|| {
-                    Arc::new(transform.inner.outputs(
-                        &TransformContext {
-                            enrichment_tables: enrichment_tables.clone(),
-                            metrics_storage: METRICS_STORAGE.clone(),
-                            schema: config_schema,
-                            ..Default::default()
-                        },
-                        input_definitions.as_slice(),
-                    ))
-                });
-
-                let schema_definitions = transform_outputs
-                    .iter()
-                    .map(|output| {
-                        let definitions = output.schema_definitions(config_schema.enabled);
-                        (output.port.clone(), definitions)
-                    })
-                    .collect::<HashMap<_, _>>();
-
-                let context = TransformContext {
-                    key: Some(key.clone()),
-                    globals: config_global.clone(),
-                    enrichment_tables: enrichment_tables.clone(),
-                    metrics_storage: METRICS_STORAGE.clone(),
-                    schema_definitions,
-                    merged_schema_definition: merged_definition.clone(),
-                    schema: config_schema,
-                    extra_context: extra_context.clone(),
-                };
-
-                let node =
-                    TransformNode::from_parts(
-                        key.clone(),
-                        transform,
-                        transform_outputs.as_ref().clone(),
+                    let span = error_span!(
+                        "transform",
+                        component_kind = "transform",
+                        component_id = %key.id(),
+                        component_type = %transform.inner.get_component_name(),
                     );
 
-                // Clone the inner transform config so we can move it into a spawned task.
-                let inner_clone = transform.inner.clone();
+                    let transform_outputs = schema::get_cached_transform_outputs(
+                        &outputs_cache,
+                        key,
+                    )
+                    .unwrap_or_else(|| {
+                        Arc::new(transform.inner.outputs(
+                            &TransformContext {
+                                enrichment_tables: enrichment_tables.clone(),
+                                metrics_storage: METRICS_STORAGE.clone(),
+                                schema: config_schema,
+                                ..Default::default()
+                            },
+                            input_definitions.as_slice(),
+                        ))
+                    });
 
-                (key.clone(), inner_clone, context, node, span)
-            })
-            .collect();
+                    let schema_definitions = transform_outputs
+                        .iter()
+                        .map(|output| {
+                            let definitions = output.schema_definitions(config_schema.enabled);
+                            (output.port.clone(), definitions)
+                        })
+                        .collect::<HashMap<_, _>>();
+
+                    let context = TransformContext {
+                        key: Some(key.clone()),
+                        globals: config_global.clone(),
+                        enrichment_tables: enrichment_tables.clone(),
+                        metrics_storage: METRICS_STORAGE.clone(),
+                        schema_definitions,
+                        merged_schema_definition: merged_definition.clone(),
+                        schema: config_schema,
+                        extra_context: extra_context.clone(),
+                    };
+
+                    let node =
+                        TransformNode::from_parts(
+                            key.clone(),
+                            transform,
+                            transform_outputs.as_ref().clone(),
+                        );
+
+                    let inner_clone = transform.inner.clone();
+
+                    (key.clone(), inner_clone, context, node, span)
+                })
+                .collect()
+        });
 
         info!(
             elapsed_ms = preparation_start.elapsed().as_millis() as u64,
